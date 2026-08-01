@@ -1,0 +1,35 @@
+name: alert-loop
+
+on:
+  schedule:
+    # Every 5 minutes (UTC). GitHub's scheduler is best-effort and can be
+    # delayed 10-30 min under load — worst at the top of the hour.
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+# A slow run must never pile up on top of the next scheduled one.
+concurrency:
+  group: alert-loop
+  cancel-in-progress: false
+
+jobs:
+  alert:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: Run alert loop
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        run: python alert_loop.py
