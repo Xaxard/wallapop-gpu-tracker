@@ -1,11 +1,13 @@
 # Wallapop GPU Deal-Tracker & Flip-Margin Engine
 
-Watches Wallapop for secondhand GPUs and pushes an instant Telegram alert **only
-when a listing is a genuine flip** — cheap enough to resell for ≥ €50 net after
-fees. The fair resale price is *learned* from sold + reserved comps over the last
-30 days, not from what active listings are asking.
+Watches Wallapop — across Spain, Portugal, Italy and everywhere else it
+operates, since it's one shared marketplace — for secondhand GPUs and pushes an
+instant Telegram alert whenever a listing is a genuine flip. "Genuine" means: a
+plausible negotiated offer (asking price minus a haggle discount, default 20%)
+would net ≥ €50 after fees. The fair resale price is *learned* from sold +
+reserved comps over the last 30 days, not from what active listings are asking.
 
-Runs free on GitHub Actions + Supabase, unattended.
+Runs free on GitHub Actions + Supabase, unattended, GPU-only.
 
 ```
              ┌──────────────────────────────┐
@@ -14,18 +16,26 @@ Runs free on GitHub Actions + Supabase, unattended.
              │ observations · model_prices ·│
              │ sent_alerts · junk_exclusions│
              └───────────────┬──────────────┘
-       every 5 min           │          every 60 min
+       ~every 5 min          │         ~every 60 min
 ┌──────────────────┐         │        ┌───────────────────┐
 │   ALERT LOOP     │◄────────┴───────►│    COMPS LOOP     │
-│ capped searches  │                  │ uncapped searches │
+│ nationwide/intl  │                  │ nationwide/intl   │
 │ → classify       │                  │ → record reserved │
 │ → junk filter    │                  │ → infer sold      │
-│ → margin gate    │                  │ → trimmed median  │
+│ → offer margin   │                  │ → trimmed median  │
 │ → Telegram       │                  │ → buy ceiling     │
 └────────┬─────────┘                  └───────────────────┘
          ▼
     Telegram (sendPhoto)
 ```
+
+Both loops run as a **self-dispatch chain**: each GitHub Actions run pads out
+to a ~5-min (alert) / ~60-min (comps) cycle, then triggers its own next run
+directly through the GitHub API. This is a workaround for a measured, real
+problem — GitHub's `schedule` cron trigger fired only ~once/hour on this repo
+regardless of the requested interval, while every `workflow_dispatch` call
+fired instantly. The original schedule stays wired up as a low-frequency
+safety net in case the chain ever breaks (crash, timeout, platform outage).
 
 ---
 
@@ -56,9 +66,9 @@ python -m venv .venv && .venv/bin/pip install -r requirements.txt
 ### 4. Verify before deploying
 
 ```bash
-.venv/bin/python -m pytest tests -q     # 102 tests, no network or DB needed
-.venv/bin/python smoke_test.py "rtx 4070"   # hits the live API, touches no DB
-DRY_RUN=1 .venv/bin/python alert_loop.py    # full loop, logs alerts instead of sending
+.venv/bin/python -m pytest tests -q            # 131 tests, no network or DB needed
+.venv/bin/python smoke_test.py "rtx 4070"      # hits the live API, touches no DB
+DRY_RUN=1 .venv/bin/python alert_loop.py       # full loop, logs alerts instead of sending
 ```
 
 `smoke_test.py` prints the raw response envelope plus every parsed listing with
@@ -68,8 +78,8 @@ it tells you immediately whether the API changed shape.
 ### 5. GitHub Actions
 
 Push to a **public** repo (private repos only get 2,000 free minutes/month,
-which can't sustain 5-minute polling). Then Settings → Secrets and variables →
-Actions → add:
+which can't sustain near-continuous polling). Then Settings → Secrets and
+variables → Actions → add:
 
 | Secret | |
 |---|---|
@@ -77,10 +87,12 @@ Actions → add:
 | `TELEGRAM_CHAT_ID` | your numeric chat id |
 | `SUPABASE_URL` | project URL |
 | `SUPABASE_KEY` | service_role key |
+| `GH_DISPATCH_TOKEN` | a token with `repo`+`workflow` scope — needed so each run can trigger its own successor (the auto `GITHUB_TOKEN` is blocked from doing this, to prevent recursive-run loops) |
 
-Two workflows then run themselves: [alert.yml](.github/workflows/alert.yml)
-(`*/5 * * * *`) and [comps.yml](.github/workflows/comps.yml) (`0 * * * *`).
-Trigger either manually from the Actions tab to confirm.
+Two workflows then keep themselves running via the self-dispatch chain
+described above: [alert.yml](.github/workflows/alert.yml) and
+[comps.yml](.github/workflows/comps.yml). Trigger either manually from the
+Actions tab once to start the chain.
 
 ---
 
@@ -96,19 +108,23 @@ buy_ceiling = ( ref_price·(1 − seller_fee) − buyer_fixed − shipping_in �
 
 | Constant | Default | |
 |---|---|---|
-| `SELLER_FEE` | 0.10 | Wallapop selling fee when shipped |
-| `BUYER_FEE` | 0.075 | buyer protection % |
+| `SELLER_FEE` | **0** | Wallapop charges the seller nothing — only the buyer pays a protection fee on shipped sales |
+| `BUYER_FEE` | 0.075 | buyer protection % (paid when *you* are the buyer) |
 | `BUYER_FIXED` | 0.69 | buyer protection fixed part |
 | `SHIPPING_IN` | 4.50 | inbound shipping, boxed GPU |
 | `TARGET_MARGIN` | 50 | your minimum net profit |
-| `MAX_DEAL_PRICE` | **350** | hard budget ceiling — never alert above this |
+| `OFFER_DISCOUNT` | **0.20** | how far below asking you could realistically haggle a seller down |
 
-A 4070 with a €330 reference must be **≤ €224 shipped** to clear €50 — which is
-why a flat "4070 under €400" rule alerts on junk. The in-person Madrid preset
-(all fees zero) gives `ref − 50 = €280`, and both numbers appear in every alert.
+The gate checks a **negotiated offer**, not the raw asking price: a listing
+qualifies if `asking · (1 − OFFER_DISCOUNT)` would clear `buy_ceiling`, even
+when the asking price alone wouldn't — you can always propose the discount and
+see if it lands. There's no hard price ceiling; a high-tier card at a high
+asking price still gets shown if the haggled price pencils out. Every alert
+shows the suggested offer and the net margin both at the offer and at asking.
 
-Every alert is additionally hard-capped at `MAX_DEAL_PRICE` (€350): a 4090 at
-€700 may be a superb margin, but it's not a deal you'll be shown.
+In-person meetups (all fees zero) use `ref − target_margin` instead — both
+numbers appear in every alert, though with searches now nationwide/
+international, most flips will realistically be shipped.
 
 ## What gets filtered out
 
@@ -124,7 +140,12 @@ select category, phrase, count(*) from junk_exclusions group by 1,2 order by 3 d
 - **TRADE** — `cambio por`, `solo cambio`
 - **NOT_A_CARD** — `waterblock`, `backplate`, `soporte grafica`, …
 - **BUNDLE** — `pc gaming`, `pc gamer`, `ordenador gaming`, …
-- **LAPTOP** — `legion`, `portatil`, `proart`, `aorus 17`, `tuf a15`, mobile CPU suffixes, …
+- **LAPTOP** — `legion`, `portatil`, `proart p16`/`px13`, `aorus 17`, `tuf a15`, mobile CPU suffixes, …
+- **CPU** — `procesador`, `microprocesador` — catches AMD Ryzen listings whose
+  model number numerically collides with a Radeon GPU's (Ryzen 5 "7600" vs
+  Radeon RX "7600", both bare numbers with no differentiating suffix). This one
+  is deliberately narrow: not the bare `ryzen`/`amd` brand words, since those
+  can legitimately appear in a real GPU title mentioning CPU compatibility.
 
 Only the DEFECT/WANTED/TRADE lists follow the strict phrase-only rule. BUNDLE
 and LAPTOP were added after live testing showed they're the dominant problem:
@@ -162,20 +183,25 @@ from model_prices order by is_seed, n_comps desc;
 
 | Want to | Do |
 |---|---|
-| Change the budget ceiling | `MAX_DEAL_PRICE` in `.env` / repo secrets |
+| Change how much you'd haggle | `OFFER_DISCOUNT` in `.env` (default 0.20) |
+| Ignore cheap junk/scam listings | `MIN_SANE_PRICE` (default 50 — a real GPU below that is never genuine) |
 | Add a GPU model | one entry in `models.REGISTRY` (most-specific first) |
 | Add/disable a search | edit the `searches` table, or `seed.py` and re-run it |
-| Buy in person only | set `SELLER_FEE=0 BUYER_FEE=0 BUYER_FIXED=0 SHIPPING_IN=0` |
-| Widen/narrow the area | `WP_DEFAULT_DISTANCE_KM`, or `distance_km` per search row |
-| Silence a bad filter | remove the phrase from `junk.py` (check `junk_exclusions` first) |
+| Buy in person only | set `BUYER_FEE=0 BUYER_FIXED=0 SHIPPING_IN=0` (`SELLER_FEE` is always 0) |
+| Silence a bad filter | remove the phrase/token from `junk.py` (check `junk_exclusions` first) |
 
 ## Known limits
 
-- **GitHub Actions cron is best-effort.** 5-minute floor, UTC only, and delays
-  of 10–30 min under load (worst at the top of the hour). For tighter polling,
-  run `alert_loop.run_once()` in a `while` loop on an Oracle Cloud Always Free
-  VM — both loops are already written as host-agnostic `run_once()` entrypoints,
-  so it's a config change, not a rewrite.
+- **GitHub Actions' `schedule` trigger is unreliable in practice, not just
+  "best-effort."** Measured on this repo: over ~4.5 hours, the 5-minute alert
+  cron and the 60-minute comps cron both fired only about once per hour —
+  GitHub was silently throttling scheduled triggers regardless of the
+  requested interval, while every manual/API `workflow_dispatch` fired
+  instantly. Both workflows now self-dispatch their own next run instead of
+  depending on `schedule` (see above); the cron stays wired up only as a
+  low-frequency fallback. If this ever regresses, check the Actions tab for a
+  broken chain (a run that didn't trigger its successor) before assuming the
+  code is at fault.
 - **Scheduled workflows auto-disable after 60 days of repo inactivity.** The
   comps workflow pushes a daily `.keepalive` commit to prevent that.
 - **Sold data is inferred, not given** — Wallapop exposes no sold feed.
@@ -186,10 +212,15 @@ from model_prices order by is_seed, n_comps desc;
   sits at `data.section.payload.items`. All of this is read through fallback
   chains. If fetches start failing, copy fresh headers from DevTools → Network
   into `wallapop_client.HEADERS`.
-- **Listings aren't distance-tagged by the API** — distance is computed locally
-  from each listing's coordinates against your configured centre.
+- **There's no API country filter.** Wallapop runs one shared marketplace
+  across Spain, Portugal, Italy etc. rather than per-country endpoints —
+  `country_code`/`country` query params are silently ignored (verified live).
+  Dropping lat/lon/distance from the request is what actually surfaces
+  cross-border listings, which is why both loops search nationwide now.
+  Distance is still computed locally from each listing's coordinates, purely
+  informational since most flips will now be shipped rather than in-person.
 - Automated querying is a grey area under Wallapop's ToS. This is deliberately
-  personal-scale: browser-like UA, 5-minute polling, modest pagination.
+  personal-scale: browser-like UA, modest polling cadence, modest pagination.
 
 ## Layout
 
