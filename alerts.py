@@ -102,7 +102,12 @@ def build_caption(
             lines[-3] = lines[-3][: max(0, len(lines[-3]) - overflow)] + "…"
             caption = "\n".join(lines)
         else:
-            caption = caption[: CAPTION_LIMIT - 1] + "…"
+            # Every line's HTML tags open and close within that same line, so
+            # cutting at the last newline can never sever one — a mid-tag cut
+            # would make Telegram reject the whole message as unparsable HTML.
+            truncated = caption[: CAPTION_LIMIT - 1]
+            safe_cut = truncated.rfind("\n")
+            caption = (truncated[:safe_cut] if safe_cut > 0 else truncated) + "…"
     return caption
 
 

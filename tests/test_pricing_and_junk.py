@@ -194,6 +194,26 @@ def test_desktop_cards_are_not_mistaken_for_laptops(title):
     assert not verdict.excluded, f"wrongly excluded on {verdict.phrase!r} ({verdict.category})"
 
 
+@pytest.mark.parametrize(
+    "title",
+    [
+        "ASUS ProArt P16 – RTX 4070 / 64GB RAM / 2TB SSD",
+        "Asus ProArt PX13 Ryzen 9 RTX 4060",
+        "Portátil Asus ProArt Studiobook 16",
+    ],
+)
+def test_proart_laptops_are_excluded(title):
+    """ProArt P16/PX13 are laptop model numbers, unlike bare 'ProArt'."""
+    verdict = junk.check(title)
+    assert verdict.excluded and verdict.category == "LAPTOP"
+
+
+def test_proart_graphics_card_is_not_mistaken_for_a_laptop():
+    """ProArt is also a real ASUS desktop-GPU sub-brand — must survive."""
+    verdict = junk.check("ASUS ProArt GeForce RTX 4080 OC 16GB")
+    assert not verdict.excluded, f"wrongly excluded on {verdict.phrase!r}"
+
+
 def test_exclusion_reports_phrase_and_category():
     verdict = junk.check("RTX 3070 para piezas")
     assert verdict.phrase == "para piezas"

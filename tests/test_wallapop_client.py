@@ -3,8 +3,11 @@
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import config  # noqa: E402
 import wallapop_client as wc  # noqa: E402
 
 
@@ -79,3 +82,62 @@ def test_parse_item_tolerates_missing_price():
     item = wc.parse_item({"id": "x", "title": "t"})
     assert item.price is None
     assert item.image_url is None
+
+
+# --------------------------------------------------------------- retry logic
+class FakeResponse:
+    def __init__(self, status_code, payload=None, text=""):
+        self.status_code = status_code
+        self._payload = payload or {}
+        self.text = text
+
+    def json(self):
+        return self._payload
+
+
+class FakeHttpxClient:
+    """Returns one canned response per call, in order."""
+
+    def __init__(self, responses):
+        self._responses = list(responses)
+        self.calls = 0
+
+    def get(self, url, params=None):
+        self.calls += 1
+        return self._responses[min(self.calls, len(self._responses)) - 1]
+
+
+@pytest.mark.parametrize("status", [403, 429, 500, 502, 503, 504])
+def test_retryable_statuses_are_retried_then_succeed(monkeypatch, status):
+    monkeypatch.setattr("time.sleep", lambda *_: None)
+    monkeypatch.setattr(config, "HTTP_RETRIES", 3)
+    fake = FakeHttpxClient([FakeResponse(status), FakeResponse(200, {"items": [{"id": "1"}]})])
+    client = wc.WallapopClient(client=fake)
+
+    result = client._get({"keywords": "rtx 4070"})
+
+    assert result == {"items": [{"id": "1"}]}
+    assert fake.calls == 2
+
+
+@pytest.mark.parametrize("status", [400, 404])
+def test_non_retryable_statuses_fail_immediately(monkeypatch, status):
+    monkeypatch.setattr("time.sleep", lambda *_: None)
+    monkeypatch.setattr(config, "HTTP_RETRIES", 3)
+    fake = FakeHttpxClient([FakeResponse(status, text="bad request")])
+    client = wc.WallapopClient(client=fake)
+
+    result = client._get({"keywords": "rtx 4070"})
+
+    assert result is None
+    assert fake.calls == 1  # no retry wasted on a request that can't succeed
+
+
+def test_exhausting_all_retries_returns_none(monkeypatch):
+    monkeypatch.setattr("time.sleep", lambda *_: None)
+    monkeypatch.setattr(config, "HTTP_RETRIES", 3)
+    fake = FakeHttpxClient([FakeResponse(503)])  # every attempt fails the same way
+    client = wc.WallapopClient(client=fake)
+
+    assert client._get({"keywords": "rtx 4070"}) is None
+    assert fake.calls == 3

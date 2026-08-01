@@ -297,6 +297,43 @@ def test_item_seen_again_resets_its_miss_counter():
     assert db.closed == {}
 
 
+def test_split_vram_children_are_covered_by_a_generic_comps_search(wire):
+    """Regression: a generic 'rtx 4060 ti' search must also cover its 8g/16g
+    children. classify() can resolve a listing to rtx_4060_ti_8g even though
+    only the generic key has a search row — without expanding the covered set
+    through GENERIC_FALLBACKS, that listing's closure (and its sold comp)
+    would never be detected.
+    """
+    search = {
+        "label": "Comps RTX 4060 TI",
+        "role": "comps",
+        "keywords": "rtx 4060 ti",
+        "model_key": "rtx_4060_ti",
+        "category_ids": config.CATEGORY_GPU,
+        "max_price": None,
+    }
+    db = FakeDB(
+        [search],
+        open_listings=[
+            {
+                "item_id": "c1",
+                "model_key": "rtx_4060_ti_8g",
+                "last_price": 260,
+                "last_status": "reserved",
+                "ever_reserved": True,
+                "missing_runs": 1,  # one miss already recorded last cycle
+                "title": "RTX 4060 Ti 8GB",
+            }
+        ],
+    )
+    wire(comps_loop, db, [])  # nothing returned this cycle -> c1 stays absent
+
+    stats = comps_loop.run_once()
+
+    assert stats["closed"] == 1
+    assert db.closed["c1"] == 260
+
+
 def test_never_reserved_item_closes_without_a_sold_price():
     """Vanishing without ever being reserved tells us nothing about price."""
     db = FakeDB(

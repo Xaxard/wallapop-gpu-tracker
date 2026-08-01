@@ -90,7 +90,7 @@ CARD_NOUNS = ("tarjeta grafica", "tarjeta", "grafica", "graficas", "gpu", "vga")
 LAPTOP_TOKENS = (
     "portatil", "portatiles", "notebook", "laptop",
     "legion", "zephyrus", "thinkpad", "ideapad", "vivobook", "zenbook",
-    "macbook", "proart", "victus", "alienware", "helios", "katana",
+    "macbook", "victus", "alienware", "helios", "katana",
     "cyborg", "elitebook", "probook", "latitude", "inspiron", "pavilion",
 )
 
@@ -101,6 +101,7 @@ LAPTOP_PHRASES = (
     "omen by hp",
     "predator helios",
     "rog strix g",
+    "proart studiobook",
 )
 
 # Patterns are matched against the *normalised* title, where normalise() has
@@ -113,6 +114,11 @@ LAPTOP_REGEXES = (
     # Asus TUF A15/F15 laptops. TUF *cards* are "TUF Gaming OC", never "TUF A15",
     # so this stays clear of the GPU brand.
     r"\btuf\s*[af]\s*1[3-8]\b",
+    # Asus ProArt *laptops* are the P-series ("ProArt P16", "ProArt PX13").
+    # "proart" alone is left out of LAPTOP_TOKENS because ProArt is also a real
+    # desktop GPU sub-brand ("ASUS ProArt GeForce RTX 4080 OC") — only the
+    # laptop model-number pattern is banned, not the bare word.
+    r"\bproart\s+px?\s*1[3-8]\b",
     # Mobile CPU suffixes — i7 14650HX, Ryzen 7 7840HS.
     r"\b(?:i\s*[3579]|ryzen\s*[3579])\s*\d{4,5}\s*(?:hx|hs|h)\b",
     # Explicit screen size.

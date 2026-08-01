@@ -162,8 +162,14 @@ def run_once() -> dict:
 
         # Only models whose searches actually ran this cycle may be judged
         # absent — otherwise a model with no comps search would have all its
-        # listings "sold" on the first run.
+        # listings "sold" on the first run. A generic search (e.g. "rtx 4060
+        # ti") classifies some listings into its split-VRAM children
+        # (rtx_4060_ti_8g/16g), which have no search row of their own, so those
+        # children are covered too — otherwise their listings would never be
+        # checked for closure and would never contribute a sold comp.
         covered = {s["model_key"] for s in searches if s.get("model_key")}
+        for key in list(covered):
+            covered.update(models.GENERIC_FALLBACKS.get(key, ()))
         if covered:
             stats["closed"] = infer_sales(db, covered, set(found))
 

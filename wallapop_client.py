@@ -246,6 +246,11 @@ class WallapopClient:
     def __exit__(self, *_exc: object) -> None:
         self.close()
 
+    # Rate-limited/blocked and transient server errors are worth a backoff
+    # retry; any other status (400, 404, ...) means the request itself is
+    # wrong and retrying it changes nothing.
+    _RETRYABLE_STATUS = {403, 429, 500, 502, 503, 504}
+
     def _get(self, params: dict) -> dict | None:
         """One request with backoff. Returns None once retries are exhausted."""
         for attempt in range(1, config.HTTP_RETRIES + 1):
@@ -253,7 +258,7 @@ class WallapopClient:
                 resp = self._client.get(SEARCH_URL, params=params)
                 if resp.status_code == 200:
                     return resp.json()
-                if resp.status_code in (429, 403):
+                if resp.status_code in self._RETRYABLE_STATUS:
                     wait = 2 ** attempt
                     log.warning(
                         "HTTP %s from Wallapop (attempt %d/%d) — backing off %ds",
