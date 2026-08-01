@@ -41,7 +41,7 @@ def test_parse_item_modern_shape():
             "images": [{"urls": {"big": "https://cdn/img-big.jpg"}}],
             "flags": {"reserved": True},
             "shipping_allowed": True,
-            "location": {"city": "Madrid"},
+            "location": {"city": "Madrid", "country_code": "ES"},
             "distance": 4.2,
         }
     )
@@ -52,6 +52,18 @@ def test_parse_item_modern_shape():
     assert item.reserved is True
     assert item.status == "reserved"
     assert item.location == "Madrid"
+    assert item.country == "ES"
+
+
+def test_parse_item_extracts_foreign_country():
+    item = wc.parse_item(
+        {
+            "id": "it1",
+            "title": "RTX 4070 Milano",
+            "location": {"city": "Milano", "country_code": "IT"},
+        }
+    )
+    assert item.country == "IT"
 
 
 def test_parse_item_legacy_flat_price_and_wrapper():

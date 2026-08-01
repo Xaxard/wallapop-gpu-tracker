@@ -38,10 +38,7 @@ DISCOVERY_SEARCHES = [
     ("Discovery AMD", "amd"),
 ]
 
-# Non-GPU, alert-only: no comps, no margin engine, just a capped keyword watch.
-OTHER_SEARCHES = [
-    ("Google Pixel", "google pixel", 250),
-]
+# GPU only — no other product categories tracked.
 
 # Comps searches: uncapped and nationwide for the widest distribution. The
 # variants get their own searches so their prices never contaminate the base
@@ -118,9 +115,11 @@ def build_search_rows() -> list[dict]:
                 "keywords": keywords,
                 "model_key": model_key,
                 "category_ids": GPU,
-                # Never above the hard budget ceiling (the 4070's 400 becomes 350).
-                "max_price": min(cap, config.MAX_DEAL_PRICE),
-                "distance_km": RADIUS,
+                # Bootstrap-only fallback cap, used while the model has no
+                # learned reference price yet. Not an API-side restriction —
+                # searches run nationwide/international with no price cap.
+                "max_price": cap,
+                "distance_km": None,
                 "active": True,
             }
         )
@@ -134,21 +133,7 @@ def build_search_rows() -> list[dict]:
                 "model_key": None,
                 "category_ids": GPU,
                 "max_price": None,
-                "distance_km": RADIUS,
-                "active": True,
-            }
-        )
-
-    for label, keywords, cap in OTHER_SEARCHES:
-        rows.append(
-            {
-                "label": label,
-                "role": "alert",
-                "keywords": keywords,
-                "model_key": None,
-                "category_ids": None,
-                "max_price": cap,
-                "distance_km": RADIUS,
+                "distance_km": None,
                 "active": True,
             }
         )

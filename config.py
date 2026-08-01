@@ -75,8 +75,10 @@ class FeeModel:
 TARGET_MARGIN = _f("TARGET_MARGIN", 50.0)
 
 # Default: shipped both ways — the worst case, and the gate we alert on.
+# seller_fee=0 because Wallapop charges the seller nothing; only the buyer pays
+# the protection fee (buyer_fee + buyer_fixed) when a shipped sale is protected.
 SHIPPED = FeeModel(
-    seller_fee=_f("SELLER_FEE", 0.10),
+    seller_fee=_f("SELLER_FEE", 0.0),
     buyer_fee=_f("BUYER_FEE", 0.075),
     buyer_fixed=_f("BUYER_FIXED", 0.69),
     shipping_in=_f("SHIPPING_IN", 4.50),
@@ -116,13 +118,17 @@ HTTP_RETRIES = _i("HTTP_RETRIES", 3)
 DRY_RUN = os.getenv("DRY_RUN", "0") == "1"
 
 # Sanity band — anything outside this is a typo, a bundle, or a scam listing
-# and must never enter the comps pool or trigger an alert.
-MIN_SANE_PRICE = _f("MIN_SANE_PRICE", 25.0)
+# and must never enter the comps pool or trigger an alert. A real GPU under 50
+# EUR is essentially always broken, fake, or a bait listing, never a genuine
+# flip opportunity — so 50 is a floor, not just a typo guard.
+MIN_SANE_PRICE = _f("MIN_SANE_PRICE", 50.0)
 MAX_SANE_PRICE = _f("MAX_SANE_PRICE", 4000.0)
 
-# Hard budget ceiling: never alert on a listing above this, no matter how good
-# the margin looks. Applies on top of every learned buy_ceiling.
-MAX_DEAL_PRICE = _f("MAX_DEAL_PRICE", 350.0)
+# How far below the asking price you could realistically negotiate a seller
+# down. A listing qualifies if a haggled offer at this discount would clear the
+# margin gate, even if the raw asking price alone would not — you can always
+# present the offer and see if the seller bites.
+OFFER_DISCOUNT = _f("OFFER_DISCOUNT", 0.20)
 
 
 def setup_logging() -> None:

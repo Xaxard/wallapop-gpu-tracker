@@ -52,37 +52,58 @@ def test_sanity_band():
     assert pricing.sane(300)
 
 
+def test_sub_50_eur_gpu_is_never_a_real_deal():
+    """A real GPU under 50 EUR is broken, fake, or bait — never a genuine
+    flip, so it's rejected outright rather than treated as a great margin."""
+    assert not pricing.sane(49.99)
+    assert not pricing.sane(30)
+    assert pricing.sane(50)
+
+
 # ------------------------------------------------------------------- gating
-def test_evaluate_uses_learned_ceiling():
+def test_evaluate_gates_on_the_offer_price_not_the_asking_price(monkeypatch):
+    """qualifies iff a haggled offer (asking * (1 - OFFER_DISCOUNT)) clears the
+    learned buy_ceiling — not the raw asking price. ceiling=224, discount=20%
+    means any asking price up to 224/0.8=280 should qualify.
+    """
+    monkeypatch.setattr(config, "OFFER_DISCOUNT", 0.20)
     row = {"ref_price": 330, "buy_ceiling": 224.0, "buy_ceiling_in_person": 280.0, "n_comps": 12}
-    assert pricing.evaluate(210, row, None).qualifies
-    assert not pricing.evaluate(245, row, None).qualifies
+    assert pricing.evaluate(210, row, None).qualifies       # offer 168 <= 224
+    assert pricing.evaluate(250, row, None).qualifies       # offer 200 <= 224 — rescued by haggling
+    assert not pricing.evaluate(290, row, None).qualifies   # offer 232 > 224 — still too rich
 
 
-def test_evaluate_reports_both_net_margins(monkeypatch):
+def test_offer_discount_rescues_a_listing_that_fails_at_asking_price(monkeypatch):
+    """The whole point of the offer-based gate: even when the asking price
+    alone wouldn't have cleared the old ceiling check, the listing still
+    qualifies if a plausible 20% haggle would get there — you can always
+    propose the discount to the seller and see if it lands.
+    """
+    monkeypatch.setattr(config, "OFFER_DISCOUNT", 0.20)
+    row = {"ref_price": 450, "buy_ceiling": 367.27, "buy_ceiling_in_person": 400.0, "n_comps": 20}
+    deal = pricing.evaluate(400, row, None)  # 400 > 367.27 asking, but offer 320 <= 367.27
+    assert deal.qualifies
+    assert deal.offer_price == pytest.approx(320.0)
+
+
+def test_evaluate_reports_net_margin_at_offer_and_at_asking(monkeypatch):
     # Pin the fee model so a local .env override can't change the expectation.
-    monkeypatch.setattr(config, "SHIPPED", config.FeeModel(0.10, 0.075, 0.69, 4.50, 50.0, "s"))
+    monkeypatch.setattr(config, "SHIPPED", config.FeeModel(0.0, 0.075, 0.69, 4.50, 50.0, "s"))
+    monkeypatch.setattr(config, "OFFER_DISCOUNT", 0.20)
     row = {"ref_price": 330, "buy_ceiling": 224.0, "buy_ceiling_in_person": 280.0, "n_comps": 12}
-    deal = pricing.evaluate(210, row, None)
-    # 330*0.90 - (210*1.075 + 0.69 + 4.50) = 66.06
-    assert deal.net_shipped == pytest.approx(66.06, abs=0.05)
-    assert deal.net_in_person == pytest.approx(120.0, abs=0.05)
-
-
-def test_hard_budget_ceiling_beats_a_great_margin(monkeypatch):
-    """No alert above MAX_DEAL_PRICE even when the maths says it's a steal."""
-    monkeypatch.setattr(config, "MAX_DEAL_PRICE", 350.0)
-    row = {"ref_price": 1200, "buy_ceiling": 1050.0, "buy_ceiling_in_person": 1150.0, "n_comps": 20}
-    assert not pricing.evaluate(700, row, None).qualifies
-    assert pricing.evaluate(340, row, None).qualifies
-
-
-def test_hard_ceiling_also_applies_to_bootstrap_caps(monkeypatch):
-    monkeypatch.setattr(config, "MAX_DEAL_PRICE", 350.0)
-    assert not pricing.evaluate(390, None, 400).qualifies
+    deal = pricing.evaluate(280, row, None)  # asking 280, offer = 280*0.8 = 224
+    assert deal.offer_price == pytest.approx(224.0)
+    # net at offer = 330 - (224*1.075 + 0.69 + 4.50) = 84.01
+    assert deal.net_shipped == pytest.approx(84.01, abs=0.05)
+    # net at asking = 330 - (280*1.075 + 0.69 + 4.50) = 23.81 (below the 50 target the old gate required)
+    assert deal.net_shipped_at_asking == pytest.approx(23.81, abs=0.05)
+    # in-person has zero fees either way: ref - buy
+    assert deal.net_in_person == pytest.approx(106.0, abs=0.05)
 
 
 def test_evaluate_falls_back_to_bootstrap_cap():
+    """Without a learned reference, there's no margin to haggle against — the
+    bootstrap path stays a plain asking-price cap."""
     assert pricing.evaluate(180, None, 200).qualifies
     assert not pricing.evaluate(220, None, 200).qualifies
 
@@ -218,3 +239,34 @@ def test_exclusion_reports_phrase_and_category():
     verdict = junk.check("RTX 3070 para piezas")
     assert verdict.phrase == "para piezas"
     assert verdict.category == "DEFECT"
+
+
+@pytest.mark.parametrize(
+    "title",
+    [
+        "Procesador AMD Ryzen 5 7600 6 nucleos 12 hilos",
+        "Microprocesador Ryzen 5 5600X",
+    ],
+)
+def test_cpu_listings_are_excluded(title):
+    """Regression: Ryzen 5 7600 (CPU) numerically collides with Radeon RX 7600
+    (GPU) with no differentiating suffix on either side — a real production
+    listing was misclassified as a confident 'DEAL' on RX 7600 before this fix.
+    The filter is deliberately narrow ("procesador"/"microprocesador" only, not
+    the bare "ryzen"/"amd" brand names) so it doesn't cost real GPU listings
+    that merely mention CPU compatibility.
+    """
+    verdict = junk.check(title)
+    assert verdict.excluded and verdict.category == "CPU"
+
+
+def test_bare_ryzen_mention_does_not_exclude():
+    """'ryzen' alone isn't in CPU_TOKENS — a title naming it without
+    "procesador" isn't confidently a CPU listing, and being too strict here
+    risks dropping real GPU deals."""
+    assert not junk.check("AMD Ryzen 7 7700X sin usar").excluded
+
+
+def test_card_mentioning_a_compatible_cpu_survives():
+    verdict = junk.check("Tarjeta grafica RTX 4070 ideal para Ryzen 5000")
+    assert not verdict.excluded, f"wrongly excluded on {verdict.phrase!r}"

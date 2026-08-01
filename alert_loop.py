@@ -35,6 +35,7 @@ def _listing_row(item: Item, match: models.Match) -> dict:
         "shipping": item.shipping,
         "location": str(item.location) if item.location else None,
         "distance_km": item.distance_km,
+        "country": item.country,
         "missing_runs": 0,
     }
 
@@ -90,20 +91,18 @@ def run_once() -> dict:
 
         with WallapopClient() as wp:
             for search in searches:
-                # The API-side cap is always clamped to the hard budget ceiling,
-                # which keeps the response volume down. The search's own
-                # max_price still governs the bootstrap gate below.
-                cap = search.get("max_price")
-                api_cap = min(float(cap), config.MAX_DEAL_PRICE) if cap else config.MAX_DEAL_PRICE
-
+                # Nationwide/international — Wallapop is one shared marketplace
+                # across Spain, Portugal, Italy etc., and there's no API-side
+                # price cap here either: the search's max_price is only the
+                # bootstrap fallback used below when a model has no learned
+                # reference price yet. The real filter is the margin gate.
                 items = wp.search(
                     search["keywords"],
                     min_price=search.get("min_price"),
-                    max_price=api_cap,
                     category_ids=search.get("category_ids"),
-                    distance_km=search.get("distance_km"),
                     order_by="newest",
                     max_pages=config.ALERT_MAX_PAGES,
+                    nationwide=True,
                 )
                 count = kept = 0
                 for item in items:

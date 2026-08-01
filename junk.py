@@ -104,6 +104,15 @@ LAPTOP_PHRASES = (
     "proart studiobook",
 )
 
+# CPU listings, not GPUs — AMD Ryzen model numbers can numerically collide
+# with Radeon GPU model numbers with no differentiating suffix (Ryzen 5 "7600"
+# vs Radeon RX "7600"), which let a processor get misclassified as a graphics
+# card. Deliberately narrow (not "ryzen" or "amd"): those brand names can
+# legitimately appear in a GPU title mentioning compatibility ("ideal para
+# Ryzen 5000"), and being too strict here costs real GPU deals. "procesador"/
+# "microprocesador" only ever show up when the product itself is a CPU.
+CPU_TOKENS = ("procesador", "microprocesador")
+
 # Patterns are matched against the *normalised* title, where normalise() has
 # already split letter/digit runs ("i7 14650HX" -> "i 7 14650 hx").
 LAPTOP_REGEXES = (
@@ -171,6 +180,9 @@ def check(title: str | None, description: str | None = None) -> JunkVerdict:
                 return JunkVerdict(True, phrase, "BUNDLE")
 
         tokens = set(norm_title.split())
+        for token in CPU_TOKENS:
+            if token in tokens:
+                return JunkVerdict(True, token, "CPU")
         for token in LAPTOP_TOKENS:
             if token in tokens:
                 return JunkVerdict(True, token, "LAPTOP")

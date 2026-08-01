@@ -61,10 +61,11 @@ def build_caption(
     lines.append(price_line)
 
     if deal.priced:
-        margin = (
-            f"📊 ref {_eur(deal.ref_price)} · techo {_eur(deal.ceiling_shipped)} · "
-            f"neto {_signed(deal.net_shipped)} (envío) / {_signed(deal.net_in_person)} (mano)"
-        )
+        offer_line = f"🤝 ofrece {_eur(deal.offer_price)} · neto {_signed(deal.net_shipped)} (envío) / {_signed(deal.net_in_person)} (mano)"
+        lines.append(offer_line)
+        margin = f"📊 ref {_eur(deal.ref_price)} · techo {_eur(deal.ceiling_shipped)}"
+        if deal.net_shipped_at_asking is not None and deal.net_shipped_at_asking >= 0:
+            margin += f" · a precio pedido: {_signed(deal.net_shipped_at_asking)}"
         if deal.is_seed:
             margin += "  ⚠️ <i>seed</i>"
         elif deal.n_comps:
@@ -74,6 +75,8 @@ def build_caption(
     where = []
     if item.location:
         where.append(html.escape(str(item.location)))
+    if item.country and item.country.upper() != "ES":
+        where.append(html.escape(item.country.upper()))
     if item.distance_km is not None:
         try:
             where.append(f"{float(item.distance_km):.0f} km")

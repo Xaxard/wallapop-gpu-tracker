@@ -39,6 +39,10 @@ def normalise(text: str | None) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
+# "amd" stays in, even though AMD also makes Ryzen CPUs whose model numbers
+# can collide with Radeon GPU numbers (Ryzen 5 7600 vs RX 7600) — junk.py's
+# CPU_TOKENS filter is the line of defense for that case. Dropping "amd" here
+# would cost real AMD GPU listings that don't literally say "rx"/"radeon".
 BRAND_TOKENS = (
     "rtx", "gtx", "nvidia", "geforce", "radeon", "rx", "amd", "gpu",
     "grafica", "graficas", "tarjeta grafica", "vga",

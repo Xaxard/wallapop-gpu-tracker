@@ -177,9 +177,10 @@ def test_cheap_card_alerts_and_is_recorded(wire):
     assert db.recorded == [("a1", 180.0, "new")]
 
 
-def test_card_above_the_ceiling_is_silent(wire):
+def test_card_still_above_ceiling_even_after_a_haggle_is_silent(wire):
+    # ref=300, ceiling=220. Even a 20%-off offer (280*0.8=224) stays above it.
     db = FakeDB([ALERT_SEARCH], PRICES)
-    wire(alert_loop, db, [make_item("a2", "RTX 3070 Asus", 240.0)])
+    wire(alert_loop, db, [make_item("a2", "RTX 3070 Asus", 280.0)])
     assert alert_loop.run_once()["alerts_sent"] == 0
 
 
@@ -239,16 +240,19 @@ def test_irrelevant_result_under_the_cap_is_dropped(wire):
     assert db.junk == []  # not junk, just not what we searched for
 
 
-def test_hard_budget_ceiling_blocks_expensive_cards(wire, monkeypatch):
-    monkeypatch.setattr(config, "MAX_DEAL_PRICE", 350.0)
+def test_high_tier_card_qualifies_via_offer_even_above_old_static_cap(wire):
+    """There's no hard price ceiling anymore — a 4090 asking more than the raw
+    ceiling still qualifies as long as a realistic 20% haggle would clear it.
+    """
     search = dict(ALERT_SEARCH, label="RTX 4090", keywords="rtx 4090",
-                  model_key="rtx_4090", max_price=900)
+                  model_key="rtx_4090", max_price=None)
     prices = {"rtx_4090": {"ref_price": 1200.0, "buy_ceiling": 1050.0,
                            "buy_ceiling_in_person": 1150.0, "n_comps": 9, "is_seed": False}}
     db = FakeDB([search], prices)
-    wire(alert_loop, db, [make_item("a10", "RTX 4090 Gigabyte", 700.0)])
-
-    assert alert_loop.run_once()["alerts_sent"] == 0
+    tg = wire(alert_loop, db, [make_item("a10", "RTX 4090 Gigabyte", 1100.0)])
+    # asking 1100 > ceiling 1050, but offer 1100*0.8=880 <= 1050 -> qualifies.
+    assert alert_loop.run_once()["alerts_sent"] == 1
+    assert tg.sent[0][2] == 1100.0
 
 
 # ------------------------------------------------------------- sale inference

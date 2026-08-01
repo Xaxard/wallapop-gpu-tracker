@@ -122,15 +122,23 @@ def recompute_model_price(db: Database, model_key: str, existing: dict | None) -
 # ------------------------------------------------------------- deal gating
 @dataclass
 class Deal:
-    """The margin verdict for one listing."""
+    """The margin verdict for one listing.
+
+    `offer_price` is the haggled price (asking discounted by OFFER_DISCOUNT)
+    that the qualification gate actually checks — not the raw asking price.
+    You can always try to negotiate down, so a listing qualifies whenever a
+    realistic offer would clear the margin, even if the asking price wouldn't.
+    """
 
     qualifies: bool
     reason: str
     ref_price: float | None = None
     ceiling_shipped: float | None = None
     ceiling_in_person: float | None = None
+    offer_price: float | None = None
     net_shipped: float | None = None
     net_in_person: float | None = None
+    net_shipped_at_asking: float | None = None
     is_seed: bool = False
     n_comps: int = 0
 
@@ -142,17 +150,15 @@ class Deal:
 def evaluate(price: float, model_row: dict | None, bootstrap_cap: float | None) -> Deal:
     """Decide whether a listing clears the margin gate.
 
-    With a reference price we use the learned buy-ceiling. Without one (a model
-    with too few comps, or an unclassifiable listing) we fall back to the
-    search's bootstrap cap and send a plain "matches your search" alert.
+    With a reference price, the gate checks the negotiated offer price
+    (asking * (1 - OFFER_DISCOUNT)) against the learned buy-ceiling — a listing
+    that doesn't clear the margin at asking can still qualify if a plausible
+    haggle would get there. Without a reference (too few comps, or an
+    unclassifiable listing) we fall back to the search's bootstrap cap on the
+    raw asking price and send a plain "matches your search" alert.
     """
     if not sane(price):
         return Deal(False, "price outside sanity band")
-
-    # Hard budget ceiling, applied before anything else: a 4090 at 700 EUR may
-    # be a superb margin, but it's not a deal you want to be shown.
-    if price > config.MAX_DEAL_PRICE:
-        return Deal(False, f"above hard budget ceiling {config.MAX_DEAL_PRICE:.0f}EUR")
 
     if model_row and model_row.get("ref_price"):
         ref = float(model_row["ref_price"])
@@ -160,18 +166,22 @@ def evaluate(price: float, model_row: dict | None, bootstrap_cap: float | None) 
         ceiling = float(ceiling) if ceiling is not None else config.SHIPPED.buy_ceiling(ref)
         ceiling_ip = model_row.get("buy_ceiling_in_person")
         ceiling_ip = float(ceiling_ip) if ceiling_ip is not None else config.IN_PERSON.buy_ceiling(ref)
-        deal = Deal(
-            qualifies=price <= ceiling,
-            reason="clears buy ceiling" if price <= ceiling else f"above ceiling {ceiling:.0f}EUR",
+
+        offer_price = round(price * (1 - config.OFFER_DISCOUNT), 2)
+        qualifies = offer_price <= ceiling
+        return Deal(
+            qualifies=qualifies,
+            reason="offer clears buy ceiling" if qualifies else f"offer still above ceiling {ceiling:.0f}EUR",
             ref_price=ref,
             ceiling_shipped=ceiling,
             ceiling_in_person=ceiling_ip,
-            net_shipped=config.SHIPPED.net_margin(price, ref),
-            net_in_person=config.IN_PERSON.net_margin(price, ref),
+            offer_price=offer_price,
+            net_shipped=config.SHIPPED.net_margin(offer_price, ref),
+            net_in_person=config.IN_PERSON.net_margin(offer_price, ref),
+            net_shipped_at_asking=config.SHIPPED.net_margin(price, ref),
             is_seed=bool(model_row.get("is_seed")),
             n_comps=int(model_row.get("n_comps") or 0),
         )
-        return deal
 
     if bootstrap_cap is not None:
         under = price <= float(bootstrap_cap)

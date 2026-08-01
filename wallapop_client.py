@@ -53,6 +53,7 @@ class Item:
     shipping: bool
     location: str | None
     distance_km: float | None
+    country: str | None = None
 
     @property
     def status(self) -> str:
@@ -227,6 +228,7 @@ def parse_item(raw: dict) -> Item | None:
         shipping=_shipping(raw),
         location=_first(raw, "location.city", "location.name", "user.location.city"),
         distance_km=_distance_km(raw),
+        country=_first(raw, "location.country_code", "user.location.country_code"),
     )
 
 
@@ -287,8 +289,13 @@ class WallapopClient:
     ) -> Iterator[Item]:
         """Yield parsed items, following pagination up to max_pages.
 
-        `nationwide=True` drops the geo filter entirely, which is what the comps
-        loop wants: the widest possible price distribution per model.
+        `nationwide=True` drops the geo filter entirely. Wallapop runs one
+        shared marketplace across Spain, Portugal, Italy (and more) rather than
+        per-country endpoints — there's no country_code/country param that
+        actually restricts results (verified live: both are silently ignored),
+        so dropping lat/lon/distance is the only way to see the full
+        cross-border listing pool. Both loops use this now: comps needs the
+        widest price distribution, and alerts want every country's deals.
         """
         base: dict[str, Any] = {**REQUIRED_PARAMS, "keywords": keywords, "order_by": order_by}
         if not nationwide:

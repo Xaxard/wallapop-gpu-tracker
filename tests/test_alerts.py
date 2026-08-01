@@ -12,12 +12,14 @@ from wallapop_client import Item  # noqa: E402
 
 DEAL = Deal(
     qualifies=True,
-    reason="clears buy ceiling",
+    reason="offer clears buy ceiling",
     ref_price=330.0,
     ceiling_shipped=224.0,
     ceiling_in_person=280.0,
+    offer_price=168.0,
     net_shipped=55.0,
     net_in_person=120.0,
+    net_shipped_at_asking=19.0,
     is_seed=False,
     n_comps=12,
 )
@@ -36,6 +38,7 @@ def make_item(**overrides):
         shipping=True,
         location="Madrid",
         distance_km=4.0,
+        country="ES",
     )
     base.update(overrides)
     return Item(**base)
@@ -96,3 +99,20 @@ def test_html_special_characters_in_title_are_escaped():
     caption = build_caption(item, DEAL, "new", None, "RTX 4070")
     assert "<script>" not in caption
     assert "&lt;script&gt;" in caption
+
+
+def test_offer_price_is_shown_for_a_priced_deal():
+    caption = build_caption(make_item(), DEAL, "new", None, "RTX 4070")
+    assert "168€" in caption  # the suggested offer, not just the asking price
+
+
+def test_foreign_country_is_shown_in_location_line():
+    caption = build_caption(make_item(country="IT", location="Milano"), DEAL, "new", None, "RTX 4070")
+    assert "IT" in caption
+
+
+def test_spain_is_not_called_out_as_foreign():
+    caption = build_caption(make_item(country="ES"), DEAL, "new", None, "RTX 4070")
+    location_line = next(line for line in caption.splitlines() if line.startswith("📍"))
+    segments = [s.strip() for s in location_line.split("·")]
+    assert "ES" not in segments

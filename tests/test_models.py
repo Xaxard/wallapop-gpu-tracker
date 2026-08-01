@@ -63,6 +63,17 @@ def test_brand_token_lifts_confidence():
     assert match.priceable
 
 
+def test_amd_grants_high_confidence_even_though_it_also_names_cpus():
+    """'amd' stays a brand token (recall over precision — real AMD GPU
+    listings don't always say "rx"/"radeon" literally). The Ryzen-vs-Radeon
+    number collision (Ryzen 5 7600 vs RX 7600) is instead guarded by junk.py's
+    CPU_TOKENS filter, not by stripping 'amd' from the confidence check here.
+    """
+    match = models.classify("Procesador AMD Ryzen 5 7600 6 nucleos 12 hilos")
+    assert match.model_key == "rx_7600"
+    assert match.confidence == "high"  # junk.check() is what stops this listing, not classify()
+
+
 def test_vram_from_description_only():
     match = models.classify("RTX 4060 Ti Asus Dual OC", "Tarjeta con 16 GB de memoria GDDR6")
     assert match.model_key == "rtx_4060_ti_16g"
