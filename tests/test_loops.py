@@ -177,6 +177,25 @@ def test_cheap_card_alerts_and_is_recorded(wire):
     assert db.recorded == [("a1", 180.0, "new")]
 
 
+def test_dry_run_never_writes_to_the_dedup_table(wire, monkeypatch):
+    """Regression: DRY_RUN skips the real Telegram send but FakeTelegram (and
+    the real Telegram class) still returns True for logging purposes. If that
+    True were treated as a real send, db.record_alert() would mark the item as
+    already-alerted — silently suppressing the real alert once this actually
+    runs for real. A production incident: local DRY_RUN testing polluted
+    sent_alerts with 16 fake rows, none of which ever reached Telegram.
+    """
+    monkeypatch.setattr(config, "DRY_RUN", True)
+    db = FakeDB([ALERT_SEARCH], PRICES)
+    tg = wire(alert_loop, db, [make_item("a11", "RTX 3070 Gigabyte OC", 180.0)])
+
+    stats = alert_loop.run_once()
+
+    assert stats["alerts_sent"] == 1   # still visible/counted for the dry-run log
+    assert tg.sent[0][0] == "a11"
+    assert db.recorded == []           # but never persisted to the dedup table
+
+
 def test_card_still_above_ceiling_even_after_a_haggle_is_silent(wire):
     # ref=300, ceiling=220. Even a 20%-off offer (280*0.8=224) stays above it.
     db = FakeDB([ALERT_SEARCH], PRICES)

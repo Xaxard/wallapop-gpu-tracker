@@ -191,12 +191,17 @@ def run_once() -> dict:
                 continue
 
             if sent:
-                db.record_alert(item.item_id, float(item.price), kind)
                 stats["alerts_sent"] += 1
                 log.info(
                     "ALERT %-12s %s %.0f EUR — %s",
                     kind, match.model_key or "unclassified", item.price, item.title[:60],
                 )
+                # DRY_RUN never touches Telegram, so it must never touch the
+                # dedup table either — a dry-run "send" marking an item as
+                # already-alerted would silently suppress the real alert the
+                # next time this actually runs for real.
+                if not config.DRY_RUN:
+                    db.record_alert(item.item_id, float(item.price), kind)
 
         return stats
 
