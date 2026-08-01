@@ -2,6 +2,8 @@ name: comps-loop
 
 on:
   schedule:
+    # Safety net only — see alert.yml for why the schedule trigger alone isn't
+    # enough; the self-dispatch chain below does the real hourly cadence.
     - cron: "0 * * * *"
   workflow_dispatch:
 
@@ -15,8 +17,11 @@ permissions:
 jobs:
   comps:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 70   # must comfortably exceed the ~60-min chain cycle below
     steps:
+      - name: Mark start
+        run: echo "START=$(date +%s)" >> "$GITHUB_ENV"
+
       - uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5
@@ -49,3 +54,15 @@ jobs:
             git commit -m "chore: keepalive"
             git push
           fi
+
+      # Self-dispatch keeps the real ~hourly cadence — see alert.yml for why
+      # this needs a personal token rather than the auto GITHUB_TOKEN.
+      - name: Chain next run
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GH_DISPATCH_TOKEN }}
+        run: |
+          ELAPSED=$(( $(date +%s) - START ))
+          REMAINING=$(( 3600 - ELAPSED ))
+          if [ "$REMAINING" -gt 0 ]; then sleep "$REMAINING"; fi
+          gh workflow run comps.yml --repo "${{ github.repository }}"

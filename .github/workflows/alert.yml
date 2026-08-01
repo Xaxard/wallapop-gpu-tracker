@@ -2,9 +2,11 @@ name: alert-loop
 
 on:
   schedule:
-    # Every 5 minutes (UTC). GitHub's scheduler is best-effort and can be
-    # delayed 10-30 min under load — worst at the top of the hour.
-    - cron: "*/5 * * * *"
+    # Safety net only, in case the self-dispatch chain below ever breaks (a
+    # crash, a timeout, a platform outage). GitHub's own */5 schedule proved
+    # to fire only ~once/hour in practice on this repo, nowhere near 5-minute
+    # cadence, which is why the chain does the real work.
+    - cron: "*/15 * * * *"
   workflow_dispatch:
 
 # A slow run must never pile up on top of the next scheduled one.
@@ -17,6 +19,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
+      - name: Mark start
+        run: echo "START=$(date +%s)" >> "$GITHUB_ENV"
+
       - uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5
@@ -33,3 +38,18 @@ jobs:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
         run: python alert_loop.py
+
+      # Self-dispatch is what actually keeps the ~5-minute cadence: the repo's
+      # auto-generated GITHUB_TOKEN can't trigger workflow_dispatch (GitHub
+      # blocks that to prevent recursive-run loops), so this uses a personal
+      # token instead, stored as a secret. `if: always()` ensures the chain
+      # survives even if the run above fails or crashes.
+      - name: Chain next run
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GH_DISPATCH_TOKEN }}
+        run: |
+          ELAPSED=$(( $(date +%s) - START ))
+          REMAINING=$(( 300 - ELAPSED ))
+          if [ "$REMAINING" -gt 0 ]; then sleep "$REMAINING"; fi
+          gh workflow run alert.yml --repo "${{ github.repository }}"
