@@ -17,7 +17,15 @@ import config  # noqa: E402
 from wallapop_client import Item  # noqa: E402
 
 
-def make_item(item_id, title, price, reserved=False, description=""):
+def make_item(
+    item_id,
+    title,
+    price,
+    reserved=False,
+    description="",
+    condition=None,
+    taxonomy=(),
+):
     return Item(
         item_id=item_id,
         title=title,
@@ -30,15 +38,26 @@ def make_item(item_id, title, price, reserved=False, description=""):
         shipping=True,
         location="Madrid",
         distance_km=4.0,
+        condition=condition,
+        taxonomy=taxonomy,
     )
 
 
 class FakeDB:
-    def __init__(self, searches, model_prices=None, alerted=None, open_listings=None):
+    def __init__(
+        self,
+        searches,
+        model_prices=None,
+        alerted=None,
+        open_listings=None,
+        runs=None,
+    ):
         self._searches = searches
         self._model_prices = model_prices or {}
         self._alerted = alerted or {}
         self._open = open_listings or []
+        self._runs = runs or []
+        self.purged = False
         self.listings = []
         self.observations = []
         self.recorded = []
@@ -97,10 +116,26 @@ class FakeDB:
     def upsert_model_price(self, row):
         self.model_writes.append(row)
 
+    def sold_durations(self, model_key, since):
+        return []
+
+    def open_reserved_listings(self, keys):
+        return [r for r in self._open if r.get("ever_reserved")]
+
+    def purge_old_observations(self):
+        self.purged = True
+
+    def recent_runs(self, loop_name, limit):
+        return self._runs[:limit]
+
 
 class FakeClient:
+    """Stands in for WallapopClient in both roles: the search context manager
+    and the plain detail client the alert loop keeps open across candidates."""
+
     def __init__(self, items):
         self._items = items
+        self.detail_calls = []
 
     def __enter__(self):
         return self
@@ -108,8 +143,22 @@ class FakeClient:
     def __exit__(self, *a):
         pass
 
+    def close(self):
+        pass
+
     def search(self, keywords, **kwargs):
+        self.last_search_kwargs = kwargs
         yield from self._items
+
+    def fetch_detail(self, item_id):
+        self.detail_calls.append(item_id)
+        for item in self._items:
+            if item.item_id == item_id:
+                return item
+        return None
+
+    def is_alive(self, item_id):
+        return any(i.item_id == item_id for i in self._items)
 
 
 class FakeTelegram:
@@ -259,19 +308,82 @@ def test_irrelevant_result_under_the_cap_is_dropped(wire):
     assert db.junk == []  # not junk, just not what we searched for
 
 
-def test_high_tier_card_qualifies_via_offer_even_above_old_static_cap(wire):
-    """There's no hard price ceiling anymore — a 4090 asking more than the raw
-    ceiling still qualifies as long as a realistic 20% haggle would clear it.
-    """
+def test_card_qualifies_via_offer_even_when_asking_is_above_the_ceiling(wire):
+    """The offer-based gate: asking can sit above the raw ceiling and still
+    qualify, as long as a realistic 20% haggle would clear it."""
+    search = dict(ALERT_SEARCH, label="RTX 3070", keywords="rtx 3070",
+                  model_key="rtx_3070", max_price=None)
+    prices = {"rtx_3070": {"ref_price": 300.0, "buy_ceiling": 220.0,
+                           "buy_ceiling_in_person": 250.0, "n_comps": 9, "is_seed": False}}
+    db = FakeDB([search], prices)
+    tg = wire(alert_loop, db, [make_item("a10", "RTX 3070 Gigabyte", 270.0)])
+    # asking 270 > ceiling 220, but offer 270*0.8=216 <= 220 -> qualifies.
+    assert alert_loop.run_once()["alerts_sent"] == 1
+    assert tg.sent[0][2] == 270.0
+
+
+def test_expensive_card_never_alerts_however_good_the_margin(wire):
+    """MAX_ALERT_PRICE is a hard scope cap on the asking price, applied before
+    any margin maths. A 4090 at 1100 with a 1050 ceiling would clear the offer
+    gate comfortably, and still must not fire."""
     search = dict(ALERT_SEARCH, label="RTX 4090", keywords="rtx 4090",
                   model_key="rtx_4090", max_price=None)
     prices = {"rtx_4090": {"ref_price": 1200.0, "buy_ceiling": 1050.0,
                            "buy_ceiling_in_person": 1150.0, "n_comps": 9, "is_seed": False}}
     db = FakeDB([search], prices)
-    tg = wire(alert_loop, db, [make_item("a10", "RTX 4090 Gigabyte", 1100.0)])
-    # asking 1100 > ceiling 1050, but offer 1100*0.8=880 <= 1050 -> qualifies.
+    tg = wire(alert_loop, db, [make_item("a11", "RTX 4090 Gigabyte", 1100.0)])
+
+    stats = alert_loop.run_once()
+    assert stats["alerts_sent"] == 0
+    assert stats["over_cap"] == 1
+    assert tg.sent == []
+
+
+def test_underpriced_high_end_card_still_gets_through_the_cap(wire):
+    """The flip side, and the whole reason the cap is on price rather than on
+    model tier: a 4090 mistakenly listed at 340 is the best possible outcome
+    and must survive."""
+    search = dict(ALERT_SEARCH, label="RTX 4090", keywords="rtx 4090",
+                  model_key="rtx_4090", max_price=None)
+    prices = {"rtx_4090": {"ref_price": 1200.0, "buy_ceiling": 1050.0,
+                           "buy_ceiling_in_person": 1150.0, "n_comps": 9, "is_seed": False}}
+    db = FakeDB([search], prices)
+    tg = wire(alert_loop, db, [make_item("a12", "RTX 4090 Gigabyte", 340.0)])
+
     assert alert_loop.run_once()["alerts_sent"] == 1
-    assert tg.sent[0][2] == 1100.0
+    assert tg.sent[0][2] == 340.0
+
+
+def test_bottom_condition_tier_is_blocked_but_fair_is_not(wire):
+    """The dead-card filter. Only `has_given_it_all` is blocked — `fair` is a
+    working card with a cosmetic flaw, which is exactly what a flip is."""
+    db = FakeDB([ALERT_SEARCH], PRICES)
+    tg = wire(
+        alert_loop,
+        db,
+        [
+            make_item("dead", "RTX 3070 Gigabyte", 180.0, condition="has_given_it_all"),
+            make_item("worn", "RTX 3070 Asus Dual", 180.0, condition="fair"),
+        ],
+    )
+
+    stats = alert_loop.run_once()
+    assert stats["blocked_condition"] == 1
+    assert [s[0] for s in tg.sent] == ["worn"]
+
+
+def test_whole_machine_price_never_enters_a_comps_pool(wire):
+    """A prebuilt that names a card is a real listing but not a comp for the
+    loose card — its observation must carry no model_key."""
+    db = FakeDB([ALERT_SEARCH], PRICES)
+    wire(
+        alert_loop,
+        db,
+        [make_item("pc1", "RTX 3070 Gigabyte", 300.0, taxonomy=(24200, 24203, 24115, 24117))],
+    )
+
+    alert_loop.run_once()
+    assert [o["model_key"] for o in db.observations] == [None]
 
 
 # ------------------------------------------------------------- sale inference

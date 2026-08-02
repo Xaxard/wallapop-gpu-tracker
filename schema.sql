@@ -44,6 +44,25 @@ create table if not exists listings (
 create index if not exists listings_model_key_idx on listings (model_key);
 create index if not exists listings_last_seen_idx on listings (last_seen);
 
+-- ------------------------------------------- [ext] structured API fields
+-- Wallapop returns all of these; they were previously being re-derived from
+-- free text (or ignored). Written as idempotent ALTERs so an existing project
+-- can be migrated by re-running this file.
+alter table listings add column if not exists condition text;
+  -- un_opened|in_box|new|as_good_as_new|good|fair|has_given_it_all
+alter table listings add column if not exists brand text;
+alter table listings add column if not exists taxonomy int[];
+alter table listings add column if not exists whole_machine boolean default false;
+  -- true when taxonomy lands in a laptop/prebuilt leaf: excluded from comps
+  -- (its price is not a comp for a loose card) but NOT from alerts.
+alter table listings add column if not exists posted_at timestamptz;
+  -- the seller's real created_at, not when we first saw it
+alter table listings add column if not exists user_allows_shipping boolean;
+  -- distinct from `shipping` (item_is_shippable), which is a category
+  -- capability rather than this seller's choice
+
+create index if not exists listings_posted_at_idx on listings (posted_at desc);
+
 -- ------------------------------------------------------------ observations
 create table if not exists observations (
   id         bigint generated always as identity primary key,
@@ -68,6 +87,18 @@ create table if not exists model_prices (
   updated_at   timestamptz default now(),
   is_seed      boolean default false
 );
+
+-- ------------------------------------------- [ext] comps provenance
+-- Asking prices are free to post and mean nothing; these split out what the
+-- reference price was actually built from.
+alter table model_prices add column if not exists n_sold int default 0;
+alter table model_prices add column if not exists n_reserved int default 0;
+alter table model_prices add column if not exists raw_ref numeric;
+  -- observed quantile before shrinkage toward the sibling prior
+alter table model_prices add column if not exists shrunk boolean default false;
+alter table model_prices add column if not exists median_days_to_sale numeric;
+  -- how long this model actually takes to move: a 50 EUR margin in 6 days and
+  -- one in 45 days are not the same trade
 
 -- -------------------------------------------------------------- sent_alerts
 create table if not exists sent_alerts (

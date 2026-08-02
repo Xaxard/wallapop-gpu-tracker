@@ -94,3 +94,59 @@ def test_normalise():
 def test_every_registry_key_is_unique():
     keys = [m.key for m in models.REGISTRY]
     assert len(keys) == len(set(keys))
+
+
+def test_every_model_has_a_seed_price():
+    """A model with an alert search but no seed price falls through to the
+    bootstrap-cap branch and fires a bare "matches your search" alert with no
+    margin analysis — exactly the noise the margin engine replaces. Caught in
+    production the first time RX 6000 searches were added without prices."""
+    import seed
+
+    registry = {m.key for m in models.REGISTRY}
+    priced = set(seed.SEED_PRICES)
+    assert registry - priced == set(), f"no seed price for: {sorted(registry - priced)}"
+    assert priced - registry == set(), f"seed price for unknown model: {sorted(priced - registry)}"
+
+
+def test_every_alert_search_targets_a_priced_model():
+    import seed
+
+    priced = set(seed.SEED_PRICES)
+    unpriced = [key for _, _, key, _ in seed.ALERT_SEARCHES if key not in priced]
+    assert not unpriced, f"alert searches with no reference price: {unpriced}"
+
+
+# ------------------------------------------------- cross-vendor number collisions
+def test_vintage_geforce_7600_is_not_priced_as_a_radeon_rx_7600():
+    """AMD's RX 7600 is 2023; NVIDIA's GeForce 7600 GS is 2006. A real listing,
+    "PC de escritorio HP P4 + Nvidia 7600GS" at 60 EUR, used to classify as a
+    high-confidence RX 7600 and report a 143 EUR margin on a twenty-year-old
+    card. The number still matches — but nvidia branding must not vouch for an
+    AMD key, so it drops below priceable and can never reach the margin engine.
+    """
+    match = models.classify("PC de escritorio HP P4 + Nvidia 7600GS")
+    assert match.model_key == "rx_7600"
+    assert match.confidence == "low"
+    assert not match.priceable
+
+
+def test_real_radeon_still_classifies_high():
+    for title in ("Tarjeta Grafica AMD Radeon RX 7600 8GB", "Grafica RX 6600 8GB"):
+        match = models.classify(title)
+        assert match.priceable, title
+
+
+def test_own_brand_token_outranks_a_rival_mention():
+    """Sellers write sloppy titles and legitimately name both vendors ("cambio
+    mi RX 7600 por una Nvidia"). A rival token only downgrades when there is no
+    own-brand evidence at all — it never overrides a definitive one."""
+    assert models.classify("Radeon RTX 4070").priceable
+    assert models.classify("cambio mi RX 7600 por una Nvidia").priceable
+
+
+def test_generic_card_words_still_vouch_for_either_vendor():
+    """"grafica"/"gpu"/"vga" make no vendor claim, so they keep working as
+    proof for both sides."""
+    assert models.classify("Tarjeta grafica 4070 12GB").priceable
+    assert models.classify("Tarjeta grafica 7600 8GB").priceable

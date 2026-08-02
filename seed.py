@@ -22,20 +22,43 @@ RADIUS = config.DEFAULT_DISTANCE_KM
 # volume down; once a model has >= MIN_COMPS the learned buy_ceiling is what
 # actually decides.
 ALERT_SEARCHES = [
+    ("RTX 3060", "rtx 3060", "rtx_3060", 150),
+    ("RTX 3060 Ti", "rtx 3060 ti", "rtx_3060_ti", 185),
     ("RTX 3070", "rtx 3070", "rtx_3070", 200),
+    ("RTX 3070 Ti", "rtx 3070 ti", "rtx_3070_ti", 240),
     ("RTX 3080", "rtx 3080", "rtx_3080", 250),
     ("RTX 4060", "rtx 4060", "rtx_4060", 200),
-    ("RTX 4070", "rtx 4070", "rtx_4070", 400),
+    ("RTX 4060 Ti", "rtx 4060 ti", "rtx_4060_ti", 280),
+    ("RTX 4070", "rtx 4070", "rtx_4070", 330),
     ("RTX 5060", "rtx 5060", "rtx_5060", 250),
+    ("RX 6700 XT", "rx 6700 xt", "rx_6700_xt", 220),
+    ("RX 6800", "rx 6800", "rx_6800", 260),
+    ("RX 7600", "rx 7600", "rx_7600", 200),
     ("RX 9060 XT", "9060 xt", "rx_9060_xt", 350),
 ]
 
 # Broad discovery: no bootstrap cap, so these only ever fire when the margin
 # engine has a confident reference price and the listing clears the ceiling.
+#
+# These matter more than the model-targeted searches above, because they are
+# the only way a *mispriced high-end* card is ever seen — nobody writes a
+# search for "RTX 4090" expecting one at 340 EUR, but that is exactly the
+# listing worth catching, and MAX_ALERT_PRICE lets it through on price while
+# the margin gate proves it is real.
+#
+# Measured hit rates per 120 results (2026-08-02): "rtx" 37 classified,
+# "tarjeta grafica" 20, "grafica" 11, "rx" 5, "amd" 5. The weak ones are kept
+# because a page costs ~0.2s and they cover AMD listings the others miss.
 DISCOVERY_SEARCHES = [
     ("Discovery RTX", "rtx"),
     ("Discovery RX", "rx"),
     ("Discovery AMD", "amd"),
+    ("Discovery Nvidia", "nvidia"),
+    ("Discovery GeForce", "geforce"),
+    ("Discovery Radeon", "radeon"),
+    ("Discovery GPU", "gpu"),
+    ("Discovery Tarjeta Grafica", "tarjeta grafica"),
+    ("Discovery Grafica", "grafica"),
 ]
 
 # GPU only — no other product categories tracked.
@@ -43,23 +66,52 @@ DISCOVERY_SEARCHES = [
 # Comps searches: uncapped and nationwide for the widest distribution. The
 # variants get their own searches so their prices never contaminate the base
 # model's median.
+# Every model in SEED_PRICES needs one, otherwise it can never learn a real
+# reference price and stays pinned to its seed forever. The high-end cards are
+# included even though nothing near their market value could ever clear
+# MAX_ALERT_PRICE: the whole point is that a 4090 listed at 340 EUR is the best
+# possible outcome, and recognising that requires knowing what a 4090 is worth.
 COMPS_MODELS = [
+    ("rtx_3050", "rtx 3050"),
+    ("rtx_3060", "rtx 3060"),
+    ("rtx_3060_ti", "rtx 3060 ti"),
     ("rtx_3070", "rtx 3070"),
     ("rtx_3070_ti", "rtx 3070 ti"),
     ("rtx_3080", "rtx 3080"),
     ("rtx_3080_ti", "rtx 3080 ti"),
+    ("rtx_3090", "rtx 3090"),
     ("rtx_4060", "rtx 4060"),
     ("rtx_4060_ti", "rtx 4060 ti"),
     ("rtx_4070", "rtx 4070"),
     ("rtx_4070_super", "rtx 4070 super"),
     ("rtx_4070_ti", "rtx 4070 ti"),
     ("rtx_4070_ti_super", "rtx 4070 ti super"),
+    ("rtx_4080", "rtx 4080"),
+    ("rtx_4080_super", "rtx 4080 super"),
+    ("rtx_4090", "rtx 4090"),
     ("rtx_5060", "rtx 5060"),
     ("rtx_5060_ti", "rtx 5060 ti"),
-    ("rx_9060_xt", "rx 9060 xt"),
+    ("rtx_5070", "rtx 5070"),
+    ("rtx_5070_ti", "rtx 5070 ti"),
+    ("rtx_5080", "rtx 5080"),
+    ("rtx_5090", "rtx 5090"),
+    ("rx_6600", "rx 6600"),
+    ("rx_6600_xt", "rx 6600 xt"),
+    ("rx_6650_xt", "rx 6650 xt"),
+    ("rx_6700_xt", "rx 6700 xt"),
+    ("rx_6750_xt", "rx 6750 xt"),
+    ("rx_6800", "rx 6800"),
+    ("rx_6800_xt", "rx 6800 xt"),
     ("rx_7600", "rx 7600"),
+    ("rx_7600_xt", "rx 7600 xt"),
     ("rx_7700_xt", "rx 7700 xt"),
     ("rx_7800_xt", "rx 7800 xt"),
+    ("rx_7900_gre", "rx 7900 gre"),
+    ("rx_7900_xt", "rx 7900 xt"),
+    ("rx_7900_xtx", "rx 7900 xtx"),
+    ("rx_9060_xt", "rx 9060 xt"),
+    ("rx_9070", "rx 9070"),
+    ("rx_9070_xt", "rx 9070 xt"),
 ]
 
 # Rough current-market resale values in EUR, used only until each model has
@@ -92,7 +144,26 @@ SEED_PRICES = {
     "rtx_5060_ti_16g": 380,
     "rtx_5070": 480,
     "rtx_5070_ti": 650,
+    # Every key in models.REGISTRY needs an entry. A model with an alert search
+    # but no seed price falls through to the bootstrap-cap branch, which fires a
+    # bare "matches your search" alert with no margin analysis at all — the
+    # noisy behaviour the margin engine exists to replace. There is a test
+    # pinning REGISTRY and SEED_PRICES to the same key set.
+    "rtx_3080_12g": 310,
+    "rtx_3090_ti": 520,
+    "rtx_5080": 900,
+    "rtx_5090": 1800,
+    "rx_6600": 130,
+    "rx_6600_xt": 150,
+    "rx_6650_xt": 165,
+    "rx_6700_xt": 200,
+    "rx_6750_xt": 225,
+    "rx_6800": 250,
+    "rx_6800_xt": 290,
     "rx_7600": 200,
+    "rx_7600_xt": 230,
+    "rx_9060_xt_8g": 260,
+    "rx_9060_xt_16g": 300,
     "rx_7700_xt": 320,
     "rx_7800_xt": 400,
     "rx_7900_gre": 480,

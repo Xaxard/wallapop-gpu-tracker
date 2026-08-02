@@ -23,6 +23,19 @@ MADRID = ZoneInfo("Europe/Madrid")
 CAPTION_LIMIT = 1024
 DESC_CHARS = 200
 
+# The API's condition enum, in the words Wallapop itself shows the seller.
+# Printing the raw value ("as_good_as_new") in an alert is noise; an unknown
+# key falls through unchanged so a new tier never blanks the line.
+CONDITION_ES = {
+    "un_opened": "Sin abrir",
+    "in_box": "En caja",
+    "new": "Nuevo",
+    "as_good_as_new": "Como nuevo",
+    "good": "Buen estado",
+    "fair": "Aceptable",
+    "has_given_it_all": "Ha dado lo mejor de si",
+}
+
 
 def _eur(value: float | None) -> str:
     if value is None:
@@ -36,6 +49,23 @@ def _signed(value: float | None) -> str:
     return f"{value:+,.0f}€".replace(",", ".")
 
 
+def _age_str(seconds: float | None) -> str | None:
+    """Human phrasing of listing age. The owner cares a lot about recency,
+    so this gets its own line whenever posted_at/age_seconds is available.
+    """
+    if seconds is None or seconds < 0:
+        return None
+    minutes = seconds / 60
+    if minutes < 1:
+        return "hace <1 min"
+    if minutes < 60:
+        return f"hace {round(minutes)} min"
+    hours = minutes / 60
+    if hours < 24:
+        return f"hace {round(hours)} h"
+    return f"hace {round(hours / 24)} d"
+
+
 def build_caption(
     item: Item,
     deal: Deal,
@@ -43,34 +73,76 @@ def build_caption(
     previous_price: float | None,
     model_display: str | None,
 ) -> str:
-    """The §9 alert body, as Telegram HTML."""
+    """The §9 alert body, as Telegram HTML.
+
+    No emoji anywhere — plain-text labels instead, so it reads as a normal
+    message rather than a wall of icons. Bold is reserved for the numbers
+    that matter (prices, margins) so the caption stays scannable.
+    """
     if kind == "price_drop":
-        head = "🔻 <b>PRICE DROP</b>"
+        head = "<b>BAJADA DE PRECIO</b>"
     elif deal.priced:
-        head = "🟢 <b>DEAL</b>"
+        head = "<b>CHOLLO</b>"
     else:
-        head = "🔎 <b>MATCH</b>"
+        head = "<b>COINCIDENCIA</b>"
     if model_display:
         head += f" · {html.escape(model_display)}"
 
     lines = [head]
 
-    price_line = f"💶 <b>{_eur(item.price)}</b>"
+    price_line = f"Precio: <b>{_eur(item.price)}</b>"
     if previous_price and item.price is not None and previous_price > item.price:
-        price_line += f"   <s>{_eur(previous_price)}</s>"
+        price_line += f"  (antes <s>{_eur(previous_price)}</s>)"
     lines.append(price_line)
 
     if deal.priced:
-        offer_line = f"🤝 ofrece {_eur(deal.offer_price)} · neto {_signed(deal.net_shipped)} (envío) / {_signed(deal.net_in_person)} (mano)"
-        lines.append(offer_line)
-        margin = f"📊 ref {_eur(deal.ref_price)} · techo {_eur(deal.ceiling_shipped)}"
+        lines.append(
+            f"Oferta sugerida: <b>{_eur(deal.offer_price)}</b> · "
+            f"neto envío {_signed(deal.net_shipped)} / mano {_signed(deal.net_in_person)}"
+        )
+        margin = f"Ref: <b>{_eur(deal.ref_price)}</b> · Techo: <b>{_eur(deal.ceiling_shipped)}</b>"
         if deal.net_shipped_at_asking is not None and deal.net_shipped_at_asking >= 0:
-            margin += f" · a precio pedido: {_signed(deal.net_shipped_at_asking)}"
+            margin += f" · a precio pedido: <b>{_signed(deal.net_shipped_at_asking)}</b>"
         if deal.is_seed:
-            margin += "  ⚠️ <i>seed</i>"
+            margin += "  <i>(seed)</i>"
         elif deal.n_comps:
-            margin += f"  <i>n={deal.n_comps}</i>"
+            margin += f"  <i>(n={deal.n_comps})</i>"
         lines.append(margin)
+
+    # Comp-pool provenance (median_days_to_sale / n_sold / n_reserved) is
+    # landing on Deal from a concurrent agent's pricing.py work — read
+    # defensively so this file doesn't break if the shape differs. n_sold and
+    # n_reserved default to 0 rather than None on that dataclass, and 0 comps
+    # means "no signal" here, so treat them (and median_days_to_sale) as
+    # absent whenever they're falsy and omit the whole line rather than
+    # print a placeholder.
+    median_days = getattr(deal, "median_days_to_sale", None)
+    n_sold = getattr(deal, "n_sold", None)
+    n_reserved = getattr(deal, "n_reserved", None)
+    comp_bits = []
+    if median_days is not None:
+        comp_bits.append(f"venta media {median_days:.0f} días")
+    if n_sold:
+        comp_bits.append(f"{n_sold} vendidos")
+    if n_reserved:
+        comp_bits.append(f"{n_reserved} reservados")
+    if comp_bits:
+        lines.append("Histórico: " + " · ".join(comp_bits))
+
+    # Same story for Item: condition/brand/posted_at are a concurrent
+    # agent's addition, so getattr defends against the field being missing.
+    detail_bits = []
+    condition = getattr(item, "condition", None)
+    if condition:
+        detail_bits.append(f"Estado: {html.escape(CONDITION_ES.get(condition, condition))}")
+    brand = getattr(item, "brand", None)
+    if brand:
+        detail_bits.append(f"Marca: {html.escape(str(brand))}")
+    age = _age_str(getattr(item, "age_seconds", None))
+    if age:
+        detail_bits.append(f"Publicado {age}")
+    if detail_bits:
+        lines.append(" · ".join(detail_bits))
 
     where = []
     if item.location:
@@ -82,10 +154,16 @@ def build_caption(
             where.append(f"{float(item.distance_km):.0f} km")
         except (TypeError, ValueError):
             pass
-    where.append("envío disponible" if item.shipping else "solo en mano")
-    lines.append("📍 " + " · ".join(where))
+    # can_ship reflects the seller's actual choice on this listing; `shipping`
+    # is only the category's general capability, so prefer can_ship when the
+    # (concurrent-agent-added) field is present.
+    can_ship = getattr(item, "can_ship", None)
+    if can_ship is None:
+        can_ship = item.shipping
+    where.append("envío disponible" if can_ship else "solo en mano")
+    lines.append("Ubicación: " + " · ".join(where))
 
-    lines.append("🕒 " + datetime.now(MADRID).strftime("%Y-%m-%d %H:%M"))
+    lines.append("Hora: " + datetime.now(MADRID).strftime("%Y-%m-%d %H:%M"))
     lines.append("")
     lines.append(f"<b>{html.escape(item.title[:150])}</b>")
 
@@ -94,7 +172,7 @@ def build_caption(
         lines.append(html.escape(desc))
 
     lines.append("")
-    lines.append(f"🔗 {html.escape(item.web_url)}")
+    lines.append(html.escape(item.web_url))
 
     caption = "\n".join(lines)
     if len(caption) > CAPTION_LIMIT:
@@ -112,6 +190,13 @@ def build_caption(
             safe_cut = truncated.rfind("\n")
             caption = (truncated[:safe_cut] if safe_cut > 0 else truncated) + "…"
     return caption
+
+
+def build_error_text(text: str) -> str:
+    """Error-ping body. No emoji, same as the deal caption — a bare text
+    label reads just as clearly as a warning icon and stays consistent.
+    """
+    return f"<b>wallapop-bot</b>\n<pre>{html.escape(text[:1500])}</pre>"
 
 
 class Telegram:
@@ -198,7 +283,7 @@ class Telegram:
             "sendMessage",
             {
                 "chat_id": self.chat_id,
-                "text": f"⚠️ <b>wallapop-bot</b>\n<pre>{html.escape(text[:1500])}</pre>",
+                "text": build_error_text(text),
                 "parse_mode": "HTML",
             },
         )

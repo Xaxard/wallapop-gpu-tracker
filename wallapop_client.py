@@ -13,6 +13,7 @@ import logging
 import math
 import time
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from typing import Any, Iterator
 
 import httpx
@@ -22,6 +23,7 @@ import config
 log = logging.getLogger("wallapop")
 
 SEARCH_URL = "https://api.wallapop.com/api/v3/search"
+ITEM_DETAIL_URL = "https://api.wallapop.com/api/v3/items/{item_id}"
 
 # Verified against the live API 2026-08-01: `source` is mandatory — without it
 # every request is a bare 400 regardless of the other params.
@@ -54,10 +56,38 @@ class Item:
     location: str | None
     distance_km: float | None
     country: str | None = None
+    condition: str | None = None
+    brand: str | None = None
+    taxonomy: tuple[int, ...] = ()
+    posted_at: datetime | None = None
+    modified_at: datetime | None = None
+    user_allows_shipping: bool | None = None
 
     @property
     def status(self) -> str:
         return "reserved" if self.reserved else "active"
+
+    @property
+    def can_ship(self) -> bool:
+        """Whether the *seller* actually enabled shipping on this listing.
+
+        `shipping` (item_is_shippable) is a category capability — "GPUs are a
+        shippable kind of thing" — not a seller's choice. Live listings exist
+        with item_is_shippable=true and user_allows_shipping=false, so prefer
+        the seller flag when we have it and only fall back to the category
+        flag when the API didn't return it (e.g. some search-response shapes).
+        """
+        return self.user_allows_shipping if self.user_allows_shipping is not None else self.shipping
+
+    @property
+    def whole_machine(self) -> bool:
+        return any(t in config.TAXONOMY_WHOLE_MACHINE for t in self.taxonomy)
+
+    @property
+    def age_seconds(self) -> float | None:
+        if self.posted_at is None:
+            return None
+        return (datetime.now(timezone.utc) - self.posted_at).total_seconds()
 
 
 # --------------------------------------------------------------- extraction
@@ -111,8 +141,15 @@ def _unwrap(raw: dict) -> dict:
 
 
 def _price(raw: dict) -> tuple[float | None, str]:
-    value = _first(raw, "price.amount", "price", "sale_price", "price_amount")
-    currency = _first(raw, "price.currency", "currency", default="EUR")
+    # "price.cash.amount"/"price.cash.currency" is the /items/{id} detail
+    # shape; "price.amount"/"price.currency" is the /search shape. Detail
+    # paths go first — order matters in _first, since "price" itself would
+    # resolve to a non-empty dict on the detail shape and short-circuit
+    # before the more specific path is even tried.
+    value = _first(
+        raw, "price.cash.amount", "price.amount", "price", "sale_price", "price_amount"
+    )
+    currency = _first(raw, "price.cash.currency", "price.currency", "currency", default="EUR")
     if isinstance(value, dict):  # nested one level deeper in some versions
         currency = value.get("currency", currency)
         value = value.get("amount")
@@ -169,12 +206,73 @@ def _reserved(raw: dict) -> bool:
 
 
 def _shipping(raw: dict) -> bool:
+    """Category-level shippability ("GPUs are the kind of thing Wallapop lets
+    ship"), NOT whether this particular seller enabled it. Kept as-is because
+    other code depends on this exact field; see `_user_allows_shipping` below
+    and `Item.can_ship` for the flag that actually reflects the seller.
+    """
     return _flag(
         raw,
         "shipping.item_is_shippable",
         "shipping_allowed",
         "flags.shipping_allowed",
     )
+
+
+def _user_allows_shipping(raw: dict) -> bool | None:
+    """Whether the seller enabled shipping on this specific listing.
+
+    Verified live: `item_is_shippable: true` and `user_allows_shipping: false`
+    coexist on real listings, so the two must not be conflated. Distinct from
+    `_flag` in that a missing field must stay None here (unknown), not
+    collapse to False the way `_flag`'s callers are happy to accept.
+    """
+    val = _first(raw, "shipping.user_allows_shipping")
+    if isinstance(val, dict):
+        val = val.get("flag")
+    if val is None:
+        return None
+    return bool(val)
+
+
+def _taxonomy(raw: dict) -> tuple[int, ...]:
+    """Category ids the listing is filed under.
+
+    The id is an int on the /search response but a string on the /items/{id}
+    detail response — coerce both and drop anything that isn't numeric rather
+    than let one bad node blow up the whole item.
+    """
+    nodes = raw.get("taxonomy")
+    if not isinstance(nodes, list):
+        return ()
+    ids: list[int] = []
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+        try:
+            ids.append(int(node.get("id")))
+        except (TypeError, ValueError):
+            continue
+    return tuple(ids)
+
+
+def _epoch_ms(raw: dict, *paths: str) -> datetime | None:
+    """Parse an epoch-milliseconds timestamp field (`created_at`/`modified_at`).
+
+    Bounds-checked against a sane range so a stray unit mixup (seconds
+    instead of ms) or a garbage value produces None instead of a nonsense
+    datetime decades away — never let this raise.
+    """
+    value = _first(raw, *paths)
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return None
+    try:
+        dt = datetime.fromtimestamp(value / 1000, tz=timezone.utc)
+    except (ValueError, OSError, OverflowError):
+        return None
+    if dt.year < 2015 or dt > datetime.now(timezone.utc) + timedelta(days=1):
+        return None
+    return dt
 
 
 def _haversine(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
@@ -216,10 +314,15 @@ def parse_item(raw: dict) -> Item | None:
     else:
         web_url = f"https://es.wallapop.com/item/{item_id}"
     price, currency = _price(raw)
+    # "title.original"/"description.original" is the /items/{id} detail
+    # shape (plain strings on /search); detail path goes first for the same
+    # short-circuit reason as _price above.
     return Item(
         item_id=str(item_id),
-        title=str(_first(raw, "title", "name", default="") or ""),
-        description=str(_first(raw, "description", "body", default="") or ""),
+        title=str(_first(raw, "title.original", "title", "name", default="") or ""),
+        description=str(
+            _first(raw, "description.original", "description", "body", default="") or ""
+        ),
         price=price,
         currency=currency,
         web_url=web_url,
@@ -229,6 +332,14 @@ def parse_item(raw: dict) -> Item | None:
         location=_first(raw, "location.city", "location.name", "user.location.city"),
         distance_km=_distance_km(raw),
         country=_first(raw, "location.country_code", "user.location.country_code"),
+        # condition/brand live under type_attributes on the detail endpoint;
+        # /search doesn't return them, so this is None on search results.
+        condition=_first(raw, "type_attributes.condition.value"),
+        brand=_first(raw, "type_attributes.brand.value"),
+        taxonomy=_taxonomy(raw),
+        posted_at=_epoch_ms(raw, "created_at"),
+        modified_at=_epoch_ms(raw, "modified_at"),
+        user_allows_shipping=_user_allows_shipping(raw),
     )
 
 
@@ -253,13 +364,22 @@ class WallapopClient:
     # wrong and retrying it changes nothing.
     _RETRYABLE_STATUS = {403, 429, 500, 502, 503, 504}
 
-    def _get(self, params: dict) -> dict | None:
-        """One request with backoff. Returns None once retries are exhausted."""
+    def _request(self, url: str, params: dict | None = None) -> httpx.Response | None:
+        """One GET with backoff, returning the raw response.
+
+        Shared by `_get` (search) and `fetch_detail`/`is_alive` (item detail).
+        Returns the response object rather than parsed JSON so callers that
+        need the status code — `is_alive` in particular, which must tell a
+        confirmed 404 apart from a network blip — don't lose it. A 404 is
+        returned like a 200 (not retried, not swallowed): it's a wrong-request
+        story the same way 400 is, but callers here need to see it rather than
+        have it collapse to None.
+        """
         for attempt in range(1, config.HTTP_RETRIES + 1):
             try:
-                resp = self._client.get(SEARCH_URL, params=params)
-                if resp.status_code == 200:
-                    return resp.json()
+                resp = self._client.get(url, params=params)
+                if resp.status_code == 200 or resp.status_code == 404:
+                    return resp
                 if resp.status_code in self._RETRYABLE_STATUS:
                     wait = 2 ** attempt
                     log.warning(
@@ -275,6 +395,52 @@ class WallapopClient:
                 time.sleep(2 ** attempt)
         return None
 
+    def _get(self, params: dict) -> dict | None:
+        """Search request. Returns the parsed payload, or None on any failure
+        (a 404 included — the search endpoint never legitimately returns one).
+        """
+        resp = self._request(SEARCH_URL, params)
+        if resp is None or resp.status_code != 200:
+            return None
+        try:
+            return resp.json()
+        except ValueError as exc:
+            log.warning("Malformed JSON from Wallapop: %s", exc)
+            return None
+
+    def fetch_detail(self, item_id: str) -> Item | None:
+        """GET /items/{id} and parse it. None on any failure, 404 included —
+        call `is_alive` first if the caller needs to know *why* it failed.
+        """
+        resp = self._request(ITEM_DETAIL_URL.format(item_id=item_id))
+        if resp is None or resp.status_code != 200:
+            return None
+        try:
+            payload = resp.json()
+        except ValueError as exc:
+            log.warning("Malformed JSON from Wallapop item detail: %s", exc)
+            return None
+        if not isinstance(payload, dict):
+            return None
+        return parse_item(payload)
+
+    def is_alive(self, item_id: str) -> bool | None:
+        """Whether the listing still exists on Wallapop.
+
+        False only on a confirmed 404. Any other failure (timeout, 5xx,
+        malformed response) returns None rather than False — a request we
+        couldn't complete is not evidence the item sold, and sale inference
+        must never treat "we couldn't tell" as "it's gone."
+        """
+        resp = self._request(ITEM_DETAIL_URL.format(item_id=item_id))
+        if resp is None:
+            return None
+        if resp.status_code == 404:
+            return False
+        if resp.status_code == 200:
+            return True
+        return None
+
     def search(
         self,
         keywords: str,
@@ -286,6 +452,8 @@ class WallapopClient:
         order_by: str = "newest",
         max_pages: int = 1,
         nationwide: bool = False,
+        time_filter: str | None = None,
+        condition: str | None = None,
     ) -> Iterator[Item]:
         """Yield parsed items, following pagination up to max_pages.
 
@@ -308,6 +476,15 @@ class WallapopClient:
             base["max_sale_price"] = int(max_price)
         if category_ids:
             base["category_ids"] = category_ids
+        if time_filter:
+            # Verified live 2026-08-02: any valid time_filter value ("today" /
+            # "lastWeek" / "lastMonth") raises the API's page size from 16 to
+            # 40 items — no other param does this (limit, items_count, and
+            # filters_source were all tried as controls and had zero effect).
+            # An invalid value is a straight HTTP 400, so only send it when set.
+            base["time_filter"] = time_filter
+        if condition:
+            base["condition"] = condition
 
         seen: set[str] = set()
         next_token: str | None = None

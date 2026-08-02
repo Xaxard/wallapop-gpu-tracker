@@ -7,6 +7,9 @@ today and inside a `while True` loop on a VM later without changes.
 from __future__ import annotations
 
 import logging
+import statistics
+import sys
+import time
 import traceback
 
 import config
@@ -37,6 +40,14 @@ def _listing_row(item: Item, match: models.Match) -> dict:
         "distance_km": item.distance_km,
         "country": item.country,
         "missing_runs": 0,
+        # Structured fields the API hands over that were previously re-derived
+        # from free text, or ignored entirely.
+        "condition": item.condition,
+        "brand": item.brand,
+        "taxonomy": list(item.taxonomy) or None,
+        "whole_machine": item.whole_machine,
+        "posted_at": iso(item.posted_at) if item.posted_at else None,
+        "user_allows_shipping": item.user_allows_shipping,
     }
 
 
@@ -58,6 +69,42 @@ def _relevant(search: dict, match: models.Match) -> bool:
     return True
 
 
+def _enrich(wp: WallapopClient, item: Item) -> Item:
+    """Fill in the fields only the detail endpoint returns.
+
+    Worth one extra request *only* for listings that already cleared the
+    margin gate — a handful per run, not the ~400 the search returns. The
+    search payload carries no condition at all, and condition is the single
+    strongest predictor of a dead card: every false alert measured before this
+    change was a listing the API itself labelled `has_given_it_all` or `fair`.
+    """
+    try:
+        detail = wp.fetch_detail(item.item_id)
+    except Exception:
+        log.warning("detail fetch failed for %s — proceeding on search data", item.item_id)
+        return item
+    if detail is None:
+        return item
+    for field in ("condition", "brand", "user_allows_shipping"):
+        value = getattr(detail, field, None)
+        if value is not None:
+            setattr(item, field, value)
+    if getattr(detail, "taxonomy", ()):
+        item.taxonomy = detail.taxonomy
+    return item
+
+
+def _alert_latency(item: Item) -> float | None:
+    """Seconds from the seller pressing publish to us deciding to alert.
+
+    The number that actually matters, and the one nothing was measuring.
+    Wallapop's own search indexing accounts for ~150-200s of it before this
+    process ever gets a chance to see the listing.
+    """
+    age = getattr(item, "age_seconds", None)
+    return round(age, 1) if age is not None else None
+
+
 def _decide_kind(price: float, already_sent: list[float]) -> str | None:
     """'new', 'price_drop', or None when this listing+price was already sent."""
     if not already_sent:
@@ -74,8 +121,17 @@ def run_once() -> dict:
 
     db = Database()
     run_id = db.start_run("alert")
-    stats = {"items_seen": 0, "alerts_sent": 0, "junk": 0, "errors": 0}
+    stats: dict = {
+        "items_seen": 0,
+        "alerts_sent": 0,
+        "junk": 0,
+        "errors": 0,
+        "over_cap": 0,
+        "blocked_condition": 0,
+        "latency_samples": [],
+    }
     telegram = Telegram()
+    detail_client: WallapopClient | None = None
 
     try:
         searches = db.get_searches("alert")
@@ -103,6 +159,11 @@ def run_once() -> dict:
                     order_by="newest",
                     max_pages=config.ALERT_MAX_PAGES,
                     nationwide=True,
+                    # 2.5x the items for the same request count, and the
+                    # server drops the bottom condition tier before it ever
+                    # travels. Both verified live 2026-08-02.
+                    time_filter=config.ALERT_TIME_FILTER,
+                    condition=config.ALLOWED_CONDITIONS,
                 )
                 count = kept = 0
                 for item in items:
@@ -139,11 +200,20 @@ def run_once() -> dict:
         # comps pool too, and its 5-minute cadence catches short-lived listings
         # the hourly comps loop would miss entirely.
         db.upsert_listings([_listing_row(i, m) for i, m, _ in found.values()])
+        # A whole machine's price is recorded but never attributed to a model:
+        # a prebuilt that sells for 900 EUR is a real transaction, just not a
+        # transaction in the loose card its title happens to name. Nulling the
+        # model_key keeps it out of every comps pool at the source, which is
+        # the only number that decides a ceiling.
         db.insert_observations(
             [
                 {
                     "item_id": item.item_id,
-                    "model_key": match.model_key if match.priceable else None,
+                    "model_key": (
+                        match.model_key
+                        if match.priceable and not item.whole_machine
+                        else None
+                    ),
                     "price": item.price,
                     "status": item.status,
                     "seen_at": iso(now()),
@@ -154,10 +224,32 @@ def run_once() -> dict:
         )
 
         # Reserved listings price the market but you can't buy them.
+        #
+        # MAX_ALERT_PRICE is a scope decision applied to the raw asking price
+        # before any margin maths: above it the capital at risk stops being
+        # worth it. It also removes the need to identify whole PCs and gaming
+        # laptops in the alert path at all — a machine with a card in it is
+        # essentially never listed this cheap, so the cap filters them out on
+        # price without ever having to guess at form factor from a title.
         candidates = {
-            iid: v for iid, v in found.items() if not v[0].reserved and v[0].price is not None
+            iid: v
+            for iid, v in found.items()
+            if not v[0].reserved
+            and v[0].price is not None
+            and float(v[0].price) <= config.MAX_ALERT_PRICE
         }
+        over_cap = sum(
+            1
+            for _, v in found.items()
+            if v[0].price is not None and float(v[0].price) > config.MAX_ALERT_PRICE
+        )
+        stats["over_cap"] = over_cap
+        log.info(
+            "%d candidates under %.0f EUR (%d listings priced above the cap)",
+            len(candidates), config.MAX_ALERT_PRICE, over_cap,
+        )
         already = db.alerted_prices(list(candidates))
+        detail_client = WallapopClient()
 
         for item, match, search in candidates.values():
             kind = _decide_kind(float(item.price), already.get(item.item_id, []))
@@ -176,6 +268,19 @@ def run_once() -> dict:
                 log.debug("skip %s (%s): %s", item.item_id, item.title[:40], deal.reason)
                 continue
 
+            item = _enrich(detail_client, item)
+
+            # Only the bottom tier is blocked. `fair` deliberately stays: a
+            # cosmetic flaw on a card that still works is exactly the discount
+            # a flip is built on.
+            if item.condition in config.BLOCKED_CONDITIONS:
+                stats["blocked_condition"] += 1
+                log.info(
+                    "skip %s — condition %s: %s",
+                    item.item_id, item.condition, item.title[:50],
+                )
+                continue
+
             previous = min(already.get(item.item_id, [float(item.price)]))
             try:
                 sent = telegram.send_alert(
@@ -192,9 +297,16 @@ def run_once() -> dict:
 
             if sent:
                 stats["alerts_sent"] += 1
+                latency = _alert_latency(item)
+                if latency is not None:
+                    stats["latency_samples"].append(latency)
                 log.info(
-                    "ALERT %-12s %s %.0f EUR — %s",
-                    kind, match.model_key or "unclassified", item.price, item.title[:60],
+                    "ALERT %-12s %s %.0f EUR (%s old) — %s",
+                    kind,
+                    match.model_key or "unclassified",
+                    item.price,
+                    f"{latency / 60:.1f}min" if latency is not None else "age unknown",
+                    item.title[:60],
                 )
                 # DRY_RUN never touches Telegram, so it must never touch the
                 # dedup table either — a dry-run "send" marking an item as
@@ -215,19 +327,70 @@ def run_once() -> dict:
             log.exception("could not deliver error ping")
         raise
     finally:
+        samples = stats["latency_samples"]
+        notes = (
+            f"junk_filtered={stats['junk']} over_cap={stats['over_cap']} "
+            f"blocked_condition={stats['blocked_condition']}"
+        )
+        if samples:
+            notes += f" median_latency_s={statistics.median(samples):.0f}"
         db.finish_run(
             run_id,
             items_seen=stats["items_seen"],
             alerts_sent=stats["alerts_sent"],
             errors=stats["errors"],
-            notes=f"junk_filtered={stats['junk']}",
+            notes=notes,
         )
+        # Runs after finish_run so this run's own row counts toward the streak.
+        try:
+            _check_dead_man(db, telegram)
+        except Exception:
+            log.warning("dead-man check failed", exc_info=True)
+        if detail_client is not None:
+            detail_client.close()
         telegram.close()
 
 
+def _check_dead_man(db: Database, telegram: Telegram) -> None:
+    """Warn when the bot has gone quiet rather than actually broken.
+
+    The realistic failure here is silent, not loud: Wallapop changes the
+    response shape, parsing yields an empty list, every run still "succeeds"
+    with nothing to report, and the feed simply stops. Without this the first
+    signal is noticing weeks later that no alert ever arrived.
+    """
+    runs = db.recent_runs("alert", config.DEAD_MAN_RUNS)
+    if len(runs) < config.DEAD_MAN_RUNS:
+        return
+    if all(int(r.get("items_seen") or 0) == 0 for r in runs):
+        log.error("dead-man switch: %d consecutive runs saw zero items", len(runs))
+        telegram.send_error(
+            f"{config.DEAD_MAN_RUNS} consecutive alert runs returned zero listings.\n"
+            "The API response shape has probably changed — run smoke_test.py."
+        )
+
+
+def main() -> None:
+    """One pass, or a self-paced loop on a persistent host.
+
+    `--loop` exists because the poll gap is the only part of the latency
+    budget still worth attacking: Wallapop's indexing costs ~150-200s no
+    matter what, so a 45s cadence lands near the floor while a 5-minute one
+    adds ~2.5 minutes of pure waiting. Under GitHub Actions the default
+    single-pass mode is still correct.
+    """
+    once = "--loop" not in sys.argv
+    while True:
+        result = run_once()
+        print(
+            f"items={result['items_seen']} alerts={result['alerts_sent']} "
+            f"junk={result['junk']} over_cap={result['over_cap']} "
+            f"errors={result['errors']}"
+        )
+        if once:
+            return
+        time.sleep(config.LOOP_INTERVAL_SECONDS)
+
+
 if __name__ == "__main__":
-    result = run_once()
-    print(
-        f"items={result['items_seen']} alerts={result['alerts_sent']} "
-        f"junk={result['junk']} errors={result['errors']}"
-    )
+    main()

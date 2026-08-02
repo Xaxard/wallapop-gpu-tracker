@@ -22,16 +22,55 @@ jobs:
       - name: Mark start
         run: echo "START=$(date +%s)" >> "$GITHUB_ENV"
 
+      # The schedule trigger is a *revival* mechanism, not a second engine.
+      # Firing it while the self-dispatch chain is already alive forks the
+      # chain: two independent chains then run out of phase, doubling API load
+      # and double-incrementing the missing_runs counter that drives sale
+      # inference (an item reaches "sold" in half the intended time). Observed
+      # live on this repo — two comps chains ran 8 minutes apart until the
+      # concurrency group cancelled one, and a cancelled run does NOT execute
+      # `if: always()` steps, so that fork died silently instead of chaining.
+      #
+      # So: on a scheduled trigger, stand down unless the chain has actually
+      # stopped. GUARD_MINUTES is comfortably longer than one cycle (~5 min)
+      # and shorter than the schedule interval (15 min).
+      - name: Stand down if the chain is alive
+        id: guard
+        if: github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ secrets.GH_DISPATCH_TOKEN }}
+          GUARD_MINUTES: "12"
+        run: |
+          LAST=$(gh run list --workflow alert.yml --repo "${{ github.repository }}" \
+                   --event workflow_dispatch --limit 1 \
+                   --json createdAt --jq '.[0].createdAt // empty')
+          if [ -z "$LAST" ]; then
+            echo "no dispatch run on record — reviving the chain"
+            exit 0
+          fi
+          AGE=$(( ( $(date +%s) - $(date -u -d "$LAST" +%s) ) / 60 ))
+          echo "last dispatched run was ${AGE}m ago (threshold ${GUARD_MINUTES}m)"
+          if [ "$AGE" -lt "$GUARD_MINUTES" ]; then
+            echo "chain is alive — standing down"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "chain looks dead — reviving"
+          fi
+
       - uses: actions/checkout@v4
+        if: steps.guard.outputs.skip != 'true'
 
       - uses: actions/setup-python@v5
+        if: steps.guard.outputs.skip != 'true'
         with:
           python-version: "3.12"
           cache: pip
 
       - run: pip install -r requirements.txt
+        if: steps.guard.outputs.skip != 'true'
 
       - name: Run alert loop
+        if: steps.guard.outputs.skip != 'true'
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
@@ -45,7 +84,7 @@ jobs:
       # token instead, stored as a secret. `if: always()` ensures the chain
       # survives even if the run above fails or crashes.
       - name: Chain next run
-        if: always()
+        if: always() && steps.guard.outputs.skip != 'true'
         env:
           GH_TOKEN: ${{ secrets.GH_DISPATCH_TOKEN }}
         run: |

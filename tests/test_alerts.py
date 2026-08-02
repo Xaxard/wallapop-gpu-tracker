@@ -2,13 +2,40 @@
 
 import re
 import sys
+from dataclasses import replace
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from alerts import CAPTION_LIMIT, build_caption  # noqa: E402
+from alerts import CAPTION_LIMIT, build_caption, build_error_text  # noqa: E402
 from pricing import Deal  # noqa: E402
 from wallapop_client import Item  # noqa: E402
+
+# Unicode blocks that cover essentially every emoji in normal use, plus the
+# variation selector (U+FE0F) that turns some base characters into emoji
+# presentation. A regression test walks every codepoint in the caption
+# against these ranges rather than checking for a handful of literal glyphs,
+# so it catches *any* emoji the owner didn't ask for, not just the old ones.
+EMOJI_RANGES = (
+    (0x1F300, 0x1F5FF),  # Miscellaneous Symbols and Pictographs
+    (0x1F600, 0x1F64F),  # Emoticons
+    (0x1F680, 0x1F6FF),  # Transport and Map Symbols
+    (0x1F900, 0x1F9FF),  # Supplemental Symbols and Pictographs
+    (0x2600, 0x26FF),    # Miscellaneous Symbols
+    (0x2700, 0x27BF),    # Dingbats
+)
+VARIATION_SELECTOR_16 = 0xFE0F
+
+
+def find_emoji(text: str) -> list[str]:
+    """Return every character in `text` that falls in an emoji block."""
+    hits = []
+    for ch in text:
+        cp = ord(ch)
+        if cp == VARIATION_SELECTOR_16 or any(lo <= cp <= hi for lo, hi in EMOJI_RANGES):
+            hits.append(ch)
+    return hits
 
 DEAL = Deal(
     qualifies=True,
@@ -113,6 +140,97 @@ def test_foreign_country_is_shown_in_location_line():
 
 def test_spain_is_not_called_out_as_foreign():
     caption = build_caption(make_item(country="ES"), DEAL, "new", None, "RTX 4070")
-    location_line = next(line for line in caption.splitlines() if line.startswith("📍"))
+    location_line = next(line for line in caption.splitlines() if line.startswith("Ubicación:"))
     segments = [s.strip() for s in location_line.split("·")]
     assert "ES" not in segments
+
+
+# --------------------------------------------------------------- no emoji
+
+
+def test_caption_contains_no_emoji_anywhere():
+    """Hard regression: the owner explicitly asked for a zero-emoji alert."""
+    caption = build_caption(make_item(), DEAL, "new", None, "RTX 4070")
+    assert find_emoji(caption) == []
+
+
+def test_price_drop_caption_contains_no_emoji():
+    caption = build_caption(make_item(price=180.0), DEAL, "price_drop", 210.0, "RTX 4070")
+    assert find_emoji(caption) == []
+
+
+def test_plain_match_caption_contains_no_emoji():
+    unpriced = Deal(qualifies=True, reason="under bootstrap cap")
+    caption = build_caption(make_item(), unpriced, "new", None, None)
+    assert find_emoji(caption) == []
+
+
+def test_error_text_contains_no_emoji():
+    text = build_error_text("boom: something failed")
+    assert find_emoji(text) == []
+    assert "wallapop-bot" in text
+    assert "boom: something failed" in text
+
+
+# --------------------------------------------------------- optional fields
+
+
+def test_condition_and_brand_shown_when_present():
+    item = make_item(condition="Como nuevo", brand="Gigabyte")
+    caption = build_caption(item, DEAL, "new", None, "RTX 4070")
+    assert "Estado: Como nuevo" in caption
+    assert "Marca: Gigabyte" in caption
+
+
+def test_condition_and_brand_omitted_when_absent():
+    caption = build_caption(make_item(), DEAL, "new", None, "RTX 4070")
+    assert "Estado:" not in caption
+    assert "Marca:" not in caption
+
+
+def test_posted_recency_shown_when_posted_at_present():
+    posted = datetime.now(timezone.utc) - timedelta(minutes=4)
+    item = make_item(posted_at=posted)
+    caption = build_caption(item, DEAL, "new", None, "RTX 4070")
+    assert "Publicado hace 4 min" in caption
+
+
+def test_posted_recency_omitted_when_posted_at_absent():
+    caption = build_caption(make_item(), DEAL, "new", None, "RTX 4070")
+    assert "Publicado" not in caption
+
+
+def test_comp_provenance_shown_when_fields_present():
+    """median_days_to_sale / n_sold / n_reserved land on Deal from a
+    concurrent agent's work; read them defensively and show them when set.
+    """
+    priced_deal = replace(DEAL)
+    priced_deal.median_days_to_sale = 6
+    priced_deal.n_sold = 8
+    priced_deal.n_reserved = 3
+    caption = build_caption(make_item(), priced_deal, "new", None, "RTX 4070")
+    assert "Histórico:" in caption
+    assert "venta media 6 días" in caption
+    assert "8 vendidos" in caption
+    assert "3 reservados" in caption
+
+
+def test_comp_provenance_omitted_when_fields_absent():
+    caption = build_caption(make_item(), DEAL, "new", None, "RTX 4070")
+    assert "Histórico:" not in caption
+
+
+def test_can_ship_preferred_over_category_shipping_flag():
+    """A seller who disabled shipping (`user_allows_shipping=False`) must show
+    as hand-only, even though the category itself is shippable (`shipping=True`).
+    """
+    item = make_item(shipping=True, user_allows_shipping=False)
+    caption = build_caption(item, DEAL, "new", None, "RTX 4070")
+    assert "solo en mano" in caption
+    assert "envío disponible" not in caption
+
+
+def test_can_ship_falls_back_to_shipping_flag_when_unset():
+    item = make_item(shipping=True)  # user_allows_shipping left at its default (None)
+    caption = build_caption(item, DEAL, "new", None, "RTX 4070")
+    assert "envío disponible" in caption

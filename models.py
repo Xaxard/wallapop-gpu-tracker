@@ -48,6 +48,15 @@ BRAND_TOKENS = (
     "grafica", "graficas", "tarjeta grafica", "vga",
 )
 
+# Brand tokens that belong to one vendor, used to stop a *rival's* branding
+# from validating a match. Bare model numbers collide across vendors — AMD's
+# "RX 7600" is 2023, NVIDIA's "GeForce 7600 GS" is 2006 — and without this a
+# listing reading "PC de escritorio HP P4 + Nvidia 7600GS" (a real listing, at
+# 60 EUR) classifies as an RX 7600, prices against a 200 EUR reference, and
+# reports a 143 EUR margin on a twenty-year-old card.
+AMD_TOKENS = ("rx", "radeon", "amd")
+NVIDIA_TOKENS = ("rtx", "gtx", "nvidia", "geforce")
+
 VRAM_RE = re.compile(r"\b(4|6|8|10|11|12|16|20|24|32)\s*(?:gb|g|gigas?)\b")
 
 
@@ -142,6 +151,13 @@ GENERIC_FALLBACKS = {
     "rtx_4060_ti": ("rtx_4060_ti_8g", "rtx_4060_ti_16g"),
     "rtx_5060_ti": ("rtx_5060_ti_8g", "rtx_5060_ti_16g"),
     "rx_9060_xt": ("rx_9060_xt_8g", "rx_9060_xt_16g"),
+    # Single-variant VRAM splits. Listed here for the same reason as the pairs
+    # above, but the load-bearing effect is in comps_loop: only models reachable
+    # from a search (directly or through this map) are eligible to be judged
+    # absent, so without an entry a 3060 12GB listing would never be closed and
+    # could never contribute a sold comp.
+    "rtx_3060": ("rtx_3060_12g",),
+    "rtx_3080": ("rtx_3080_12g",),
 }
 
 
@@ -189,10 +205,32 @@ def extract_vram(norm_text: str) -> int | None:
     return max(hits) if hits else None
 
 
-def _confidence(norm_text: str, has_vram_proof: bool) -> str:
-    """High when a brand token backs the number; lower for bare digits."""
-    has_brand = any(re.search(rf"\b{re.escape(b)}\b", norm_text) for b in BRAND_TOKENS)
-    if has_brand:
+def _has_token(norm_text: str, tokens: tuple[str, ...]) -> bool:
+    return any(re.search(rf"\b{re.escape(t)}\b", norm_text) for t in tokens)
+
+
+def _confidence(norm_text: str, has_vram_proof: bool, key: str) -> str:
+    """High when a brand token backs the number; lower for bare digits.
+
+    The brand has to belong to the *right* vendor. A rival's branding next to a
+    colliding model number is evidence against the match, not for it: "Nvidia
+    7600GS" is a 2006 GeForce, not a Radeon RX 7600, and treating nvidia as
+    generic proof made it a high-confidence AMD match worth 200 EUR.
+
+    A wrong-vendor title drops to 'low', which `Match.priceable` refuses, so it
+    can never reach the margin engine. It is not rejected outright — the number
+    still matched, and a listing can legitimately name both vendors ("cambio mi
+    RX 7600 por una Nvidia").
+    """
+    own, rival = (
+        (AMD_TOKENS, NVIDIA_TOKENS) if key.startswith("rx_") else (NVIDIA_TOKENS, AMD_TOKENS)
+    )
+    if _has_token(norm_text, own):
+        return "high"
+    if _has_token(norm_text, rival):
+        return "low"
+    # Only generic tokens (grafica, gpu, vga...) — no vendor claim either way.
+    if _has_token(norm_text, BRAND_TOKENS):
         return "high"
     if has_vram_proof:
         return "medium"
@@ -220,7 +258,7 @@ def classify(title: str | None, description: str | None = None) -> Match:
         if model.vram is not None:
             if vram != model.vram:
                 continue
-            return Match(model.key, model.display, _confidence(norm_title, True), vram)
-        return Match(model.key, model.display, _confidence(norm_title, False), vram)
+            return Match(model.key, model.display, _confidence(norm_title, True, model.key), vram)
+        return Match(model.key, model.display, _confidence(norm_title, False, model.key), vram)
 
     return NO_MATCH

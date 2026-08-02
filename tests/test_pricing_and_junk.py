@@ -1,6 +1,8 @@
 """Margin maths, comps trimming, and the phrase-only junk filter."""
 
+import statistics
 import sys
+from datetime import timedelta
 from pathlib import Path
 
 import pytest
@@ -10,6 +12,42 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import config  # noqa: E402
 import junk  # noqa: E402
 import pricing  # noqa: E402
+
+
+# ----------------------------------------------------- weighted-comps helpers
+class _FakeDB:
+    """Minimal stand-in for db.Database, scoped to what pricing.py reads:
+    reserved_comps / sold_comps / get_model_prices / upsert_model_price.
+    """
+
+    def __init__(self, reserved=None, sold=None, model_prices=None):
+        self._reserved = reserved or []
+        self._sold = sold or []
+        self._model_prices = dict(model_prices or {})
+        self.writes = []
+
+    def reserved_comps(self, model_key, since):
+        return self._reserved
+
+    def sold_comps(self, model_key, since):
+        return self._sold
+
+    def get_model_prices(self):
+        return self._model_prices
+
+    def upsert_model_price(self, row):
+        self.writes.append(row)
+        self._model_prices[row["model_key"]] = row
+
+
+def _reserved_row(item_id, price, age_days=0.0):
+    seen_at = (pricing.now() - timedelta(days=age_days)).isoformat()
+    return {"item_id": item_id, "price": price, "seen_at": seen_at}
+
+
+def _sold_row(item_id, price, age_days=0.0):
+    closed_at = (pricing.now() - timedelta(days=age_days)).isoformat()
+    return {"item_id": item_id, "sold_price": price, "closed_at": closed_at}
 
 
 # ------------------------------------------------------------------ margins
@@ -58,6 +96,312 @@ def test_sub_50_eur_gpu_is_never_a_real_deal():
     assert not pricing.sane(49.99)
     assert not pricing.sane(30)
     assert pricing.sane(50)
+
+
+# ------------------------------------------------------- trim dead-zone fix
+@pytest.mark.parametrize("n", range(5, 10))
+def test_trim_dead_zone_fixed_for_min_comps_regime(n):
+    """Old formula: k = int(n * TRIM_FRACTION) is 0 for every n in [5, 9] —
+    exactly MIN_COMPS through roughly double it, the size a freshly-priced
+    model sits at for a while — so a sample in this range got zero outlier
+    protection. round() plus a floor of 1 must engage here instead.
+    """
+    assert int(n * config.TRIM_FRACTION) == 0            # the bug, confirmed still true of the naive formula
+    assert pricing._trim_k(n, config.TRIM_FRACTION) >= 1  # the fix
+
+
+def test_trim_k_still_respects_the_tiny_sample_floor():
+    # n=3: dropping k=1 from each end would leave only 1 item, under the
+    # n-2k>=3 safety guard, so trimming must not fire — unchanged by the fix.
+    assert pricing.trimmed_median([100.0, 200.0, 300.0], trim=0.10) == 200
+
+
+def test_trim_is_a_no_op_when_trim_fraction_is_zero():
+    assert pricing._trim_k(7, 0.0) == 0
+
+
+def test_trimmed_median_is_provably_invariant_to_symmetric_trim():
+    """Why the fix above doesn't change trimmed_median()'s *output* at
+    n=5..9: dropping k items off each end of a sorted list never moves which
+    order statistic(s) the plain median falls on, so trimmed_median() equals
+    the untrimmed statistics.median() any time the guard lets it trim at
+    all — trimming-then-taking-a-median is a no-op by construction. The
+    bug fix earns its keep on the *weighted* pool instead (see
+    test_weighted_trim_kills_a_heavily_weighted_outlier_at_n7 below), where
+    a heavily-weighted outlier's removal genuinely shifts the interpolated
+    quantile that survives it.
+    """
+    values = [30.0, 300.0, 310.0, 315.0, 320.0]  # n=5, one bad typo price
+    assert pricing.trimmed_median(values, trim=0.10) == pricing.trimmed_median(values, trim=0.0)
+
+
+def test_weighted_trim_kills_a_heavily_weighted_outlier_at_n7():
+    """A heavily-weighted (e.g. very recent) but obviously wrong low price
+    would otherwise anchor the low end of the weighted interpolation and
+    drag the whole quantile down with it — the "single outlier does the
+    most damage in a small sample" scenario the dead-zone bug left
+    unprotected. n=7 sits squarely in the [5, 9] regime the fix targets.
+    """
+    pairs = [
+        (10.0, 10.0), (300.0, 1.0), (305.0, 1.0), (310.0, 1.0),
+        (315.0, 1.0), (320.0, 1.0), (2000.0, 1.0),
+    ]
+    untrimmed = pricing.weighted_quantile(pairs, 0.5)
+    trimmed = pricing.weighted_quantile(pricing._trim_pairs(pairs, config.TRIM_FRACTION), 0.5)
+    assert untrimmed == pytest.approx(168.18, abs=0.01)  # the outlier drags it way down
+    assert trimmed == pytest.approx(310.0)               # trimmed, it lands on the real cluster
+
+
+# --------------------------------------------------------- weighted_quantile
+def test_weighted_quantile_hand_computed():
+    # Sorted: (10, w1), (20, w1), (30, w2); total weight 4. Midpoint
+    # positions (cumulative weight so far minus half its own, over total):
+    #   10 -> (1 - 0.5)/4 = 0.125
+    #   20 -> (2 - 0.5)/4 = 0.375
+    #   30 -> (4 - 1.0)/4 = 0.75
+    # q=0.5 sits 1/3 of the way from the 20-slot to the 30-slot:
+    #   20 + 1/3 * (30 - 20) = 23.333...
+    pairs = [(30.0, 2.0), (10.0, 1.0), (20.0, 1.0)]
+    assert pricing.weighted_quantile(pairs, 0.5) == pytest.approx(23.3333, abs=1e-3)
+
+
+def test_weighted_quantile_matches_plain_median_at_equal_weights():
+    values = [10.0, 40.0, 30.0, 20.0, 50.0]
+    pairs = [(v, 1.0) for v in values]
+    assert pricing.weighted_quantile(pairs, 0.5) == pytest.approx(statistics.median(values))
+
+
+def test_weighted_quantile_extremes_and_empty():
+    pairs = [(10.0, 1.0), (20.0, 3.0), (30.0, 1.0)]
+    assert pricing.weighted_quantile(pairs, 0.0) == 10.0
+    assert pricing.weighted_quantile(pairs, 1.0) == 30.0
+    assert pricing.weighted_quantile([], 0.5) is None
+
+
+# ------------------------------------------------------------- time decay
+def test_time_decay_halves_at_the_configured_halflife():
+    assert pricing._time_decay(0) == pytest.approx(1.0)
+    assert pricing._time_decay(config.COMPS_HALFLIFE_DAYS) == pytest.approx(0.5)
+    assert pricing._time_decay(2 * config.COMPS_HALFLIFE_DAYS) == pytest.approx(0.25)
+
+
+def test_time_decay_is_monotonically_decreasing_with_age():
+    weights = [pricing._time_decay(a) for a in (0, 5, 14, 30, 60)]
+    assert weights == sorted(weights, reverse=True)
+    assert weights[-1] < weights[0]
+
+
+def test_collect_comps_weights_a_fresh_comp_above_a_stale_one():
+    """Same price, same source, only age differs — GPU prices fall
+    monotonically, so a 55-day-old comp must count for less than a
+    2-day-old one, not the same."""
+    db = _FakeDB(reserved=[
+        _reserved_row("fresh", 300.0, age_days=2),
+        _reserved_row("stale", 300.0, age_days=55),
+    ])
+    fresh_comp, stale_comp = pricing.collect_comps(db, "rtx_4070")
+    assert fresh_comp.weight > stale_comp.weight
+    assert fresh_comp.weight == pytest.approx(config.RESERVED_WEIGHT * pricing._time_decay(2), rel=1e-3)
+    assert stale_comp.weight == pytest.approx(config.RESERVED_WEIGHT * pricing._time_decay(55), rel=1e-3)
+
+
+# ------------------------------------------------------ sold vs. reserved
+def test_sold_outranks_reserved_at_equal_age():
+    """Reservations fall through, so a confirmed sale at the same age must
+    outweigh a reservation — SOLD_WEIGHT > RESERVED_WEIGHT."""
+    db = _FakeDB(
+        reserved=[_reserved_row("r1", 300.0, age_days=5)],
+        sold=[_sold_row("s1", 300.0, age_days=5)],
+    )
+    by_source = {c.source: c for c in pricing.collect_comps(db, "rtx_4070")}
+    assert by_source["sold"].weight > by_source["reserved"].weight
+    assert by_source["sold"].weight == pytest.approx(config.SOLD_WEIGHT * pricing._time_decay(5), rel=1e-3)
+    assert by_source["reserved"].weight == pytest.approx(config.RESERVED_WEIGHT * pricing._time_decay(5), rel=1e-3)
+
+
+def test_sale_overwrites_reservation_for_the_same_item():
+    """Per-item dedup still holds: a card that was reserved then confirmed
+    sold contributes once, as its sale."""
+    db = _FakeDB(
+        reserved=[_reserved_row("x", 250.0, age_days=1)],
+        sold=[_sold_row("x", 260.0, age_days=1)],
+    )
+    comps = pricing.collect_comps(db, "rtx_4070")
+    assert len(comps) == 1
+    assert comps[0].source == "sold"
+    assert comps[0].price == 260.0
+
+
+def test_reserved_comp_sitting_for_weeks_still_counts_once():
+    """500 observations of the same reserved card must not outvote real
+    turnover — dedup by item_id, first hit (newest) wins."""
+    db = _FakeDB(reserved=[_reserved_row("stuck", 300.0, age_days=d) for d in range(20)])
+    comps = pricing.collect_comps(db, "rtx_4070")
+    assert len(comps) == 1
+
+
+# ------------------------------------------------------------- prior lookup
+def test_prior_price_prefers_own_existing_ref_price():
+    db = _FakeDB(model_prices={"rtx_4060_ti_8g": {"ref_price": 999.0}})
+    assert pricing._prior_price(db, "rtx_4060_ti", {"ref_price": 280.0}) == pytest.approx(280.0)
+
+
+def test_prior_price_falls_back_to_sibling_average_when_no_own_history():
+    db = _FakeDB(model_prices={
+        "rtx_4060_ti_8g": {"ref_price": 270.0},
+        "rtx_4060_ti_16g": {"ref_price": 330.0},
+    })
+    assert pricing._prior_price(db, "rtx_4060_ti", None) == pytest.approx(300.0)
+
+
+def test_prior_price_none_when_nothing_available():
+    db = _FakeDB()
+    assert pricing._prior_price(db, "rtx_4070", None) is None
+
+
+# ---------------------------------------------------------------- shrinkage
+def test_shrinkage_pulls_hard_toward_prior_with_few_comps(monkeypatch):
+    """Right at MIN_COMPS, the sample is thin — the reference should land
+    noticeably closer to the seed/prior than a naive median-only estimate
+    would, replacing the old hard cliff (n=4 pure seed, n=5 pure observed)
+    with a smooth blend."""
+    monkeypatch.setattr(pricing, "_time_decay", lambda age: 1.0)  # isolate from clock noise
+    reserved = [_reserved_row(f"r{i}", 300.0) for i in range(config.MIN_COMPS)]
+    db = _FakeDB(reserved=reserved)
+    existing = {"ref_price": 500.0, "is_seed": True}
+
+    row = pricing.recompute_model_price(db, "rtx_4070", existing)
+
+    assert row is not None
+    assert row["raw_ref"] == pytest.approx(300.0)
+    assert row["shrunk"] is True
+    # n_eff is the *trimmed* pool's weight — trimming drops k from each end
+    # first (k=1 here, per the dead-zone fix), so only 3 of the 5 comps feed it.
+    k = pricing._trim_k(config.MIN_COMPS, config.TRIM_FRACTION)
+    n_eff = (config.MIN_COMPS - 2 * k) * config.RESERVED_WEIGHT
+    expected = (n_eff * 300.0 + config.PRIOR_WEIGHT * 500.0) / (n_eff + config.PRIOR_WEIGHT)
+    assert row["ref_price"] == pytest.approx(round(expected, 2))
+    # pulled toward the prior: closer to 500 than to the raw 300 observation
+    assert abs(500.0 - row["ref_price"]) < abs(300.0 - row["ref_price"])
+
+
+def test_shrinkage_barely_moves_the_reference_with_many_comps(monkeypatch):
+    """With a healthy sample, the same prior should have little pull — the
+    reference should sit close to what was actually observed, not the stale
+    seed."""
+    monkeypatch.setattr(pricing, "_time_decay", lambda age: 1.0)
+    n = 60
+    reserved = [_reserved_row(f"r{i}", 300.0) for i in range(n)]
+    db = _FakeDB(reserved=reserved)
+    existing = {"ref_price": 500.0, "is_seed": True}
+
+    row = pricing.recompute_model_price(db, "rtx_4070", existing)
+
+    assert row is not None
+    assert row["raw_ref"] == pytest.approx(300.0)
+    k = pricing._trim_k(n, config.TRIM_FRACTION)
+    n_eff = (n - 2 * k) * config.RESERVED_WEIGHT
+    expected = (n_eff * 300.0 + config.PRIOR_WEIGHT * 500.0) / (n_eff + config.PRIOR_WEIGHT)
+    assert row["ref_price"] == pytest.approx(round(expected, 2))
+    assert abs(row["ref_price"] - 300.0) < 30.0    # close to the real observation
+    assert abs(row["ref_price"] - 500.0) > 150.0   # nowhere near the stale prior
+
+
+def test_no_prior_available_leaves_ref_price_unshrunk(monkeypatch):
+    monkeypatch.setattr(pricing, "_time_decay", lambda age: 1.0)
+    reserved = [_reserved_row(f"r{i}", 300.0) for i in range(config.MIN_COMPS)]
+    db = _FakeDB(reserved=reserved)  # no existing row, no siblings for a leaf SKU
+
+    row = pricing.recompute_model_price(db, "rtx_4070", None)
+
+    assert row is not None
+    assert row["shrunk"] is False
+    assert row["ref_price"] == row["raw_ref"] == pytest.approx(300.0)
+
+
+# --------------------------------------------------------------- provenance
+def test_recompute_model_price_records_provenance(monkeypatch):
+    monkeypatch.setattr(pricing, "_time_decay", lambda age: 1.0)
+    reserved = [_reserved_row(f"r{i}", 300.0) for i in range(4)]
+    sold = [_sold_row(f"s{i}", 305.0) for i in range(3)]
+    db = _FakeDB(reserved=reserved, sold=sold)
+
+    row = pricing.recompute_model_price(db, "rtx_4070", None)
+
+    assert row is not None
+    assert row["n_sold"] == 3
+    assert row["n_reserved"] == 4
+    assert row["n_comps"] == 7
+    assert row["raw_ref"] is not None
+    assert row["shrunk"] is False  # no existing ref_price and no sibling prior for a leaf SKU
+
+
+def test_recompute_model_price_below_min_comps_writes_nothing():
+    db = _FakeDB(reserved=[_reserved_row("only-one", 300.0)])
+    assert pricing.recompute_model_price(db, "rtx_4070", None) is None
+    assert db.writes == []
+
+
+# ----------------------------------------------------------- time to sale
+def test_time_to_sale_days_hand_computed():
+    now = pricing.now()
+    rows = [
+        {"closed_at": now.isoformat(), "posted_at": (now - timedelta(days=d)).isoformat()}
+        for d in (2, 3, 4, 5, 6)
+    ]
+    assert pricing.time_to_sale_days(rows) == pytest.approx(4.0, abs=0.01)  # median of 2,3,4,5,6
+
+
+def test_time_to_sale_days_falls_back_to_first_seen():
+    now = pricing.now()
+    rows = [
+        {"closed_at": now.isoformat(), "first_seen": (now - timedelta(days=d)).isoformat()}
+        for d in (1, 2, 3, 4, 5)
+    ]
+    assert pricing.time_to_sale_days(rows) == pytest.approx(3.0, abs=0.01)
+
+
+def test_time_to_sale_days_none_when_not_enough_data():
+    now = pricing.now()
+    rows = [
+        {"closed_at": now.isoformat(), "posted_at": (now - timedelta(days=3)).isoformat()}
+        for _ in range(config.MIN_COMPS - 1)
+    ]
+    assert pricing.time_to_sale_days(rows) is None
+
+
+def test_time_to_sale_days_ignores_rows_missing_timestamps():
+    now = pricing.now()
+    rows = [
+        {"closed_at": now.isoformat(), "posted_at": (now - timedelta(days=d)).isoformat()}
+        for d in (1, 2, 3, 4, 5)
+    ]
+    rows.append({"closed_at": None, "posted_at": now.isoformat()})  # unusable, must not crash or count
+    assert pricing.time_to_sale_days(rows) == pytest.approx(3.0, abs=0.01)
+
+
+def test_recompute_model_price_uses_supplied_sold_rows_for_time_to_sale(monkeypatch):
+    monkeypatch.setattr(pricing, "_time_decay", lambda age: 1.0)
+    reserved = [_reserved_row(f"r{i}", 300.0) for i in range(config.MIN_COMPS)]
+    db = _FakeDB(reserved=reserved)
+    now = pricing.now()
+    sold_rows = [
+        {"closed_at": now.isoformat(), "posted_at": (now - timedelta(days=d)).isoformat()}
+        for d in (2, 3, 4, 5, 6)
+    ]
+
+    row = pricing.recompute_model_price(db, "rtx_4070", None, sold_rows=sold_rows)
+    assert row["median_days_to_sale"] == pytest.approx(4.0, abs=0.01)
+
+
+def test_recompute_model_price_carries_forward_median_days_to_sale_when_not_supplied(monkeypatch):
+    monkeypatch.setattr(pricing, "_time_decay", lambda age: 1.0)
+    reserved = [_reserved_row(f"r{i}", 300.0) for i in range(config.MIN_COMPS)]
+    db = _FakeDB(reserved=reserved)
+    existing = {"ref_price": 300.0, "median_days_to_sale": 12.5}
+
+    row = pricing.recompute_model_price(db, "rtx_4070", existing)
+    assert row["median_days_to_sale"] == pytest.approx(12.5)
 
 
 # ------------------------------------------------------------------- gating
@@ -110,6 +454,30 @@ def test_evaluate_falls_back_to_bootstrap_cap():
 
 def test_evaluate_without_reference_or_cap_never_fires():
     assert not pricing.evaluate(180, None, None).qualifies
+
+
+def test_evaluate_passes_through_provenance_fields():
+    """The alert needs to be able to show whether a reference rests on real
+    sales or just reservations, and how long the model typically takes to
+    move — evaluate() must carry those straight through from model_row."""
+    row = {
+        "ref_price": 330, "buy_ceiling": 224.0, "buy_ceiling_in_person": 280.0,
+        "n_comps": 12, "n_sold": 8, "n_reserved": 4, "median_days_to_sale": 9.5,
+    }
+    deal = pricing.evaluate(250, row, None)
+    assert deal.n_sold == 8
+    assert deal.n_reserved == 4
+    assert deal.median_days_to_sale == pytest.approx(9.5)
+
+
+def test_evaluate_defaults_provenance_fields_when_absent():
+    """Older/seed rows won't have the new columns populated yet — evaluate()
+    must not blow up, and should default sensibly."""
+    row = {"ref_price": 330, "buy_ceiling": 224.0, "buy_ceiling_in_person": 280.0, "n_comps": 12}
+    deal = pricing.evaluate(250, row, None)
+    assert deal.n_sold == 0
+    assert deal.n_reserved == 0
+    assert deal.median_days_to_sale is None
 
 
 # --------------------------------------------------------------------- junk

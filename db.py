@@ -107,18 +107,57 @@ class Database:
         return res.data or []
 
     def sold_comps(self, model_key: str, since: datetime) -> list[dict]:
-        """Listings inferred sold (reserved, then gone) inside the window."""
+        """Listings inferred sold (reserved, then gone) inside the window.
+
+        `whole_machine` rows are excluded: a gaming laptop or a prebuilt that
+        sold for 900 EUR is a real transaction, but it is not a transaction in
+        the loose card its title names, and letting it into the pool moves the
+        reference price by a whole tier.
+        """
         res = (
             self.c.table("listings")
-            .select("item_id,sold_price,closed_at")
+            .select("item_id,sold_price,closed_at,first_seen,posted_at")
             .eq("model_key", model_key)
             .eq("last_status", "closed")
             .not_.is_("sold_price", "null")
+            .eq("whole_machine", False)
             .gte("closed_at", iso(since))
             .limit(PAGE)
             .execute()
         )
         return res.data or []
+
+    def sold_durations(self, model_key: str, since: datetime) -> list[dict]:
+        """Listed-at / closed-at pairs, for median days-to-sale.
+
+        Prefers the seller's real `posted_at` over `first_seen`, which is only
+        when this bot happened to notice the listing.
+        """
+        return self.sold_comps(model_key, since)
+
+    def open_reserved_listings(self, model_keys: Sequence[str]) -> list[dict]:
+        """Reserved listings we still believe are live, for direct liveness checks.
+
+        These are the only ones worth spending a detail request on: a reserved
+        listing that disappears is the single event that produces a sold comp.
+        """
+        if not model_keys:
+            return []
+        cutoff = iso(now() - timedelta(days=config.STALE_LISTING_DAYS))
+        out: list[dict] = []
+        for batch in chunked(model_keys, 50):
+            res = (
+                self.c.table("listings")
+                .select("item_id,model_key,last_price,last_status,ever_reserved,missing_runs,title")
+                .in_("model_key", list(batch))
+                .in_("last_status", ["active", "reserved"])
+                .eq("ever_reserved", True)
+                .gte("last_seen", cutoff)
+                .limit(PAGE)
+                .execute()
+            )
+            out.extend(res.data or [])
+        return out
 
     def last_reserved_price(self, item_id: str) -> float | None:
         """Price the item carried the last time we saw it reserved."""
@@ -189,6 +228,37 @@ class Database:
             return
         for batch in chunked(rows):
             self.c.table("junk_exclusions").insert(list(batch)).execute()
+
+    def purge_old_observations(self) -> None:
+        """Keep `observations` inside the free-tier storage budget.
+
+        One row per listing per run at a 5-minute cadence is ~100k rows/day,
+        which fills a free Supabase project in weeks. Nothing older than the
+        comps window is ever read, so anything past the retention horizon is
+        pure cost.
+        """
+        cutoff = iso(now() - timedelta(days=config.OBSERVATION_RETENTION_DAYS))
+        try:
+            self.c.table("observations").delete().lt("seen_at", cutoff).execute()
+        except Exception as exc:  # housekeeping must never break a run
+            log.warning("observation purge failed: %s", exc)
+
+    def recent_runs(self, loop_name: str, limit: int) -> list[dict]:
+        """Last N finished runs, newest first — input to the dead-man switch."""
+        try:
+            res = (
+                self.c.table("run_log")
+                .select("id,items_seen,alerts_sent,errors,started_at,finished_at")
+                .eq("loop_name", loop_name)
+                .not_.is_("finished_at", "null")
+                .order("started_at", desc=True)
+                .limit(limit)
+                .execute()
+            )
+            return res.data or []
+        except Exception as exc:
+            log.warning("run history read failed: %s", exc)
+            return []
 
     def start_run(self, loop_name: str) -> int | None:
         try:

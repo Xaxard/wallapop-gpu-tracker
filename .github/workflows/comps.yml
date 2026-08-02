@@ -22,16 +22,49 @@ jobs:
       - name: Mark start
         run: echo "START=$(date +%s)" >> "$GITHUB_ENV"
 
+      # See alert.yml for the full reasoning. This workflow is where the fork
+      # was actually observed: two comps chains ran 8 minutes out of phase for
+      # over an hour, which double-increments missing_runs and can mark a
+      # reserved listing "sold" in half the intended number of runs — directly
+      # corrupting the comps pool. GUARD_MINUTES sits between one cycle
+      # (~60 min) and the point where the chain is genuinely dead.
+      - name: Stand down if the chain is alive
+        id: guard
+        if: github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ secrets.GH_DISPATCH_TOKEN }}
+          GUARD_MINUTES: "90"
+        run: |
+          LAST=$(gh run list --workflow comps.yml --repo "${{ github.repository }}" \
+                   --event workflow_dispatch --limit 1 \
+                   --json createdAt --jq '.[0].createdAt // empty')
+          if [ -z "$LAST" ]; then
+            echo "no dispatch run on record — reviving the chain"
+            exit 0
+          fi
+          AGE=$(( ( $(date +%s) - $(date -u -d "$LAST" +%s) ) / 60 ))
+          echo "last dispatched run was ${AGE}m ago (threshold ${GUARD_MINUTES}m)"
+          if [ "$AGE" -lt "$GUARD_MINUTES" ]; then
+            echo "chain is alive — standing down"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "chain looks dead — reviving"
+          fi
+
       - uses: actions/checkout@v4
+        if: steps.guard.outputs.skip != 'true'
 
       - uses: actions/setup-python@v5
+        if: steps.guard.outputs.skip != 'true'
         with:
           python-version: "3.12"
           cache: pip
 
       - run: pip install -r requirements.txt
+        if: steps.guard.outputs.skip != 'true'
 
       - name: Run comps loop
+        if: steps.guard.outputs.skip != 'true'
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
@@ -43,7 +76,7 @@ jobs:
       # which would silently kill both loops. A daily heartbeat commit keeps the
       # repo "active" without spamming the history.
       - name: Keepalive heartbeat
-        if: always()
+        if: always() && steps.guard.outputs.skip != 'true'
         run: |
           date -u +"%Y-%m-%dT%H:%M:%SZ" > .keepalive
           if [ -n "$(git status --porcelain .keepalive)" ] && \
@@ -58,7 +91,7 @@ jobs:
       # Self-dispatch keeps the real ~hourly cadence — see alert.yml for why
       # this needs a personal token rather than the auto GITHUB_TOKEN.
       - name: Chain next run
-        if: always()
+        if: always() && steps.guard.outputs.skip != 'true'
         env:
           GH_TOKEN: ${{ secrets.GH_DISPATCH_TOKEN }}
         run: |

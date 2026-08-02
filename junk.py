@@ -22,6 +22,10 @@ DEFECT = (
     "no enciende",
     "no arranca",
     "no da imagen",
+    "no da video",  # "enciende pero no da video" is the "no da imagen" variant
+                    # that was missing — live testing caught real dead cards
+                    # (powers on, no video output) passing the filter clean and
+                    # topping the bot's own highest-margin alerts.
     "sin funcionar",
     "para reparar",
     "no probada",
@@ -136,6 +140,20 @@ LAPTOP_REGEXES = (
 
 _LAPTOP_RX = tuple(re.compile(p) for p in LAPTOP_REGEXES)
 
+# A shouted "LEER" ("read [this]") in the *title* is Spanish-marketplace
+# shorthand for "there's a catch, read the description" and in practice flags
+# a real defect — "LEER Gigabyte RTX 3080 Ti Tarjeta Grafica" and "(LEERRR)
+# URGE VENTA Gigabyte AORUS RTX 3080 Ti" are both real listings that hid a
+# fault below the fold. Title only, deliberately: the *description* legitimately
+# says "leer la descripcion" / "puedes leer mas abajo" constantly, and banning
+# it there would gut half the listing pool. normalise() already lowercases and
+# strips punctuation, so "(LEERRR)" arrives here as "leerrr". The shape is
+# l + one-or-more e + one-or-more r, which catches leer/leeer/leerr/leerrr,
+# but the leading/trailing \b keeps it off real words that merely contain the
+# substring, e.g. "releer" (starts with r, not l) or "leerlo" (trailing "lo"
+# breaks the boundary).
+LEER_RX = re.compile(r"\ble+r+\b")
+
 # Only rejected when the title *starts* with one of these.
 WANTED_PREFIXES = (
     "busco",
@@ -150,6 +168,34 @@ PHRASE_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("TRADE", TRADE),
     ("NOT_A_CARD", NOT_A_CARD),
 )
+
+
+# Phrases are matched on word boundaries, never as bare substrings. A plain
+# `phrase in haystack` straddles words and silently kills good listings:
+# normalise() strips the tilde from "año", so the extremely ordinary Spanish
+# sentence "comprada hace 1 año, funciona perfecta" becomes
+# "... 1 ano funciona perfecta", in which "a[no funciona]" matches DEFECT's
+# "no funciona" as a substring. That is the worst possible failure — a working
+# card, described as working, excluded for saying so, and invisible because
+# exclusions are never alerted on.
+def _compile(phrases: tuple[str, ...]) -> tuple[tuple[str, re.Pattern[str]], ...]:
+    return tuple((p, re.compile(rf"\b{re.escape(p)}\b")) for p in phrases)
+
+
+_PHRASE_GROUPS_RX = tuple(
+    (category, _compile(phrases)) for category, phrases in PHRASE_GROUPS
+)
+_BUNDLE_RX = _compile(BUNDLE)
+_LAPTOP_PHRASES_RX = _compile(LAPTOP_PHRASES)
+
+
+def _first_hit(
+    haystack: str, compiled: tuple[tuple[str, re.Pattern[str]], ...]
+) -> str | None:
+    for phrase, rx in compiled:
+        if rx.search(haystack):
+            return phrase
+    return None
 
 
 @dataclass(frozen=True)
@@ -175,9 +221,9 @@ def check(title: str | None, description: str | None = None) -> JunkVerdict:
     # Form-factor checks run on the title only and are skipped when the title
     # opens by naming a card, so "Gráfica RTX 4070 sacada de un portátil" stays.
     if not _leads_with_card_noun(norm_title):
-        for phrase in BUNDLE:
-            if phrase in norm_title:
-                return JunkVerdict(True, phrase, "BUNDLE")
+        hit = _first_hit(norm_title, _BUNDLE_RX)
+        if hit:
+            return JunkVerdict(True, hit, "BUNDLE")
 
         tokens = set(norm_title.split())
         for token in CPU_TOKENS:
@@ -186,9 +232,9 @@ def check(title: str | None, description: str | None = None) -> JunkVerdict:
         for token in LAPTOP_TOKENS:
             if token in tokens:
                 return JunkVerdict(True, token, "LAPTOP")
-        for phrase in LAPTOP_PHRASES:
-            if phrase in norm_title:
-                return JunkVerdict(True, phrase, "LAPTOP")
+        hit = _first_hit(norm_title, _LAPTOP_PHRASES_RX)
+        if hit:
+            return JunkVerdict(True, hit, "LAPTOP")
         for rx in _LAPTOP_RX:
             hit = rx.search(norm_title)
             if hit:
@@ -198,13 +244,17 @@ def check(title: str | None, description: str | None = None) -> JunkVerdict:
         if norm_title.startswith(prefix + " ") or norm_title == prefix:
             return JunkVerdict(True, prefix, "WANTED")
 
+    leer_hit = LEER_RX.search(norm_title)
+    if leer_hit:
+        return JunkVerdict(True, leer_hit.group(0), "LEER")
+
     haystack = norm_title
     if description:
         haystack = f"{norm_title} {normalise(description)}"
 
-    for category, phrases in PHRASE_GROUPS:
-        for phrase in phrases:
-            if phrase in haystack:
-                return JunkVerdict(True, phrase, category)
+    for category, compiled in _PHRASE_GROUPS_RX:
+        hit = _first_hit(haystack, compiled)
+        if hit:
+            return JunkVerdict(True, hit, category)
 
     return CLEAN

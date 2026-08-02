@@ -39,8 +39,32 @@ LATITUDE = _f("WP_LATITUDE", 40.44)          # Madrid 28020
 LONGITUDE = _f("WP_LONGITUDE", -3.70)
 DEFAULT_DISTANCE_KM = _i("WP_DEFAULT_DISTANCE_KM", 100)
 
-# GPU / components category on Wallapop
+# Wallapop's top-level "Tecnología y electrónica" tree. Kept because the
+# searches table stores it, but note: verified live 2026-08-02, the API
+# *silently ignores* category_ids — a request for 10304 still returns gaming
+# laptops. Category filtering only works client-side, off each item's
+# `taxonomy` array. See TAXONOMY_* below.
 CATEGORY_GPU = "24200"
+
+# ------------------------------------------------------------ taxonomy leaves
+# Read off /api/v3/categories (verified live 2026-08-02).
+TAXONOMY_COMPONENTS = 10304          # "Componentes y piezas de ordenador"
+
+# Whole-machine categories. A GPU inside one of these is not a loose card, so
+# its price is not a comp for one.
+#
+# Deliberately NOT used to suppress alerts: a card inside a PC is still a
+# perfectly good buy, and the MAX_ALERT_PRICE cap below is what keeps whole
+# machines out of the alert feed. This set exists purely to keep whole-machine
+# prices out of the reference-price pool, which is the number that decides
+# every ceiling.
+TAXONOMY_WHOLE_MACHINE = frozenset({
+    24115,   # PC gaming y streaming
+    24116,   # Portátiles gaming
+    24117,   # Ordenadores sobremesa gaming
+    10309,   # Ordenadores de sobremesa
+    10310,   # Portátiles
+})
 
 
 # --------------------------------------------------------------- fee model
@@ -96,10 +120,70 @@ IN_PERSON = FeeModel(
     label="in person",
 )
 
+# ------------------------------------------------------------- item condition
+# Wallapop returns a structured condition on every listing
+# (`type_attributes.condition.value`). Full enum, verified live 2026-08-02:
+#
+#   un_opened · in_box · new · as_good_as_new · good · fair · has_given_it_all
+#
+# Only the bottom tier is blocked. Everything else — including `fair` — stays:
+# a card with a cosmetic flaw that still works is a legitimate flip, and the
+# whole point of buying secondhand is tolerating wear the seller discounted for.
+BLOCKED_CONDITIONS = frozenset(
+    c.strip()
+    for c in os.getenv("BLOCKED_CONDITIONS", "has_given_it_all").split(",")
+    if c.strip()
+)
+
+# Sent to the API as a server-side pre-filter so blocked stock never even
+# travels. The client still re-checks locally — the param is advisory and the
+# search response does not echo the condition back.
+ALLOWED_CONDITIONS = "un_opened,in_box,new,as_good_as_new,good,fair"
+
+# --------------------------------------------------------------- search shape
+# `order_by=newest` on its own cripples the result set — the API returns a
+# heavily truncated page (measured: 13 items bare, as few as 1 once a geo and
+# category filter are added) rather than a full one. Pairing it with any valid
+# `time_filter` restores a full 40-item page. Measured live 2026-08-02 on the
+# alert loop's exact shape, 2 pages: 34 items -> 80.
+#
+# Valid values are today / lastWeek / lastMonth; anything else is a 400.
+ALERT_TIME_FILTER = os.getenv("ALERT_TIME_FILTER", "lastWeek")
+
+# Deliberately empty. This is NOT symmetric with the alert loop: the comps loop
+# sorts by most_relevance, which already returns full 40-item pages without a
+# time filter, so adding one only narrows the pool. Measured on the comps
+# loop's exact shape, 5 pages: 183 items without, 166 with lastMonth — a 9%
+# loss of the distribution for no gain. Set it only if you specifically want
+# to bound comps recency at the source; the 60-day window and the age decay
+# already handle that far better.
+COMPS_TIME_FILTER = os.getenv("COMPS_TIME_FILTER", "") or None
+
 # --------------------------------------------------------------- comps math
 MIN_COMPS = _i("MIN_COMPS", 5)
-COMPS_WINDOW_DAYS = _i("COMPS_WINDOW_DAYS", 30)
+COMPS_WINDOW_DAYS = _i("COMPS_WINDOW_DAYS", 60)
 TRIM_FRACTION = _f("TRIM_FRACTION", 0.10)
+
+# Comps age out smoothly rather than falling off a 30-day cliff: a comp's
+# weight halves every COMPS_HALFLIFE_DAYS. This is what lets COMPS_WINDOW_DAYS
+# widen to 60 without stale prices dragging the reference down — old comps are
+# still counted, just quietly.
+COMPS_HALFLIFE_DAYS = _f("COMPS_HALFLIFE_DAYS", 14.0)
+
+# A reserved listing is a real signal (someone agreed to buy at that number)
+# but reservations fall through, so a confirmed sale outranks it.
+RESERVED_WEIGHT = _f("RESERVED_WEIGHT", 0.7)
+SOLD_WEIGHT = _f("SOLD_WEIGHT", 1.0)
+
+# Shrinkage toward a sibling-SKU prior, so a model with 6 comps isn't trusted
+# as hard as one with 60 and there's no cliff at MIN_COMPS:
+#   ref = (n*observed + PRIOR_WEIGHT*prior) / (n + PRIOR_WEIGHT)
+PRIOR_WEIGHT = _f("PRIOR_WEIGHT", 5.0)
+
+# Which quantile of the comps distribution to call "the" resale price. 0.5 is
+# the median — what a typical card goes for. Lowering it (0.35-0.40) prices in
+# your need to sell reasonably quickly rather than eventually.
+REF_PERCENTILE = _f("REF_PERCENTILE", 0.5)
 
 # A reserved listing must vanish from this many consecutive comps runs
 # before we treat it as sold.
@@ -129,6 +213,30 @@ MAX_SANE_PRICE = _f("MAX_SANE_PRICE", 4000.0)
 # margin gate, even if the raw asking price alone would not — you can always
 # present the offer and see if the seller bites.
 OFFER_DISCOUNT = _f("OFFER_DISCOUNT", 0.20)
+
+# Hard ceiling on what may ever trigger an alert, applied to the *asking*
+# price before any margin maths. This is a scope decision, not a maths one:
+# above it the capital at risk stops being worth it, and it's also what keeps
+# whole PCs and gaming laptops out of the feed without needing to identify
+# them — a machine with a card in it is essentially never listed under this.
+# Comps are deliberately NOT capped: the reference price needs the full
+# distribution to be meaningful.
+MAX_ALERT_PRICE = _f("MAX_ALERT_PRICE", 350.0)
+
+# ------------------------------------------------------------------- ops
+# observations grows by ~one row per listing per run; at a 5-minute cadence
+# that is ~100k rows/day and will exhaust a free Supabase project.
+OBSERVATION_RETENTION_DAYS = _i("OBSERVATION_RETENTION_DAYS", 90)
+
+# Consecutive runs returning zero items before the bot reports itself broken.
+# The realistic failure is silent: the API changes shape, parsing yields [],
+# every run "succeeds" with nothing to say, and the feed just goes quiet.
+DEAD_MAN_RUNS = _i("DEAD_MAN_RUNS", 3)
+
+# Persistent-host mode: seconds between passes when run with --loop. Wallapop's
+# own search indexing lags new listings by ~150-200s (measured), so polling
+# faster than this buys nothing.
+LOOP_INTERVAL_SECONDS = _f("LOOP_INTERVAL_SECONDS", 45.0)
 
 
 def setup_logging() -> None:
