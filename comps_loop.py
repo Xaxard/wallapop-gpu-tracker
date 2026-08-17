@@ -15,6 +15,7 @@ import config
 import junk
 import models
 import pricing
+from alert_loop import _check_dead_man
 from alerts import Telegram
 from db import Database, iso, now
 from wallapop_client import Item, WallapopClient
@@ -281,6 +282,12 @@ def run_once() -> dict:
             errors=stats["errors"],
             notes=f"closed={stats['closed']} repriced={stats['models_updated']}",
         )
+        # Runs after finish_run so this run counts toward the streak. The comps
+        # loop silently returning nothing for a day is the reason this exists.
+        try:
+            _check_dead_man(db, telegram, "comps")
+        except Exception:
+            log.warning("dead-man check failed", exc_info=True)
         telegram.close()
 
 

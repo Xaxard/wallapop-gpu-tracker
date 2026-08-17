@@ -183,14 +183,24 @@ ALLOWED_CONDITIONS = "un_opened,in_box,new,as_good_as_new,good,fair"
 # Valid values are today / lastWeek / lastMonth; anything else is a 400.
 ALERT_TIME_FILTER = os.getenv("ALERT_TIME_FILTER", "lastWeek")
 
-# Deliberately empty. This is NOT symmetric with the alert loop: the comps loop
-# sorts by most_relevance, which already returns full 40-item pages without a
-# time filter, so adding one only narrows the pool. Measured on the comps
-# loop's exact shape, 5 pages: 183 items without, 166 with lastMonth — a 9%
-# loss of the distribution for no gain. Set it only if you specifically want
-# to bound comps recency at the source; the 60-day window and the age decay
-# already handle that far better.
-COMPS_TIME_FILTER = os.getenv("COMPS_TIME_FILTER", "") or None
+# Comps send one too, and it is not optional.
+#
+# This was briefly left empty on the strength of a local measurement — from a
+# Spanish IP, most_relevance returns full pages either way, and adding a time
+# filter cost 9% of the distribution (183 items over 5 pages vs 166). That
+# measurement was worthless, because it was taken from the wrong place.
+#
+# `nationwide=True` deliberately sends no lat/lon, so the server geolocates the
+# request by IP. From a GitHub Actions runner that resolves outside Spain, and
+# a filterless query then comes back 200 OK with a well-formed envelope and an
+# empty item list. The comps loop logged "0 items" on all 40 searches, every
+# hour, for as long as run_log goes back — a total failure that looked exactly
+# like a quiet market.
+#
+# A time_filter is what makes the query return results from that IP; it is the
+# only reason the alert loop kept working. 9% less depth is the correct trade
+# against 100% less data.
+COMPS_TIME_FILTER = os.getenv("COMPS_TIME_FILTER", "lastMonth") or None
 
 # --------------------------------------------------------------- comps math
 MIN_COMPS = _i("MIN_COMPS", 5)

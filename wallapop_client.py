@@ -504,10 +504,22 @@ class WallapopClient:
             raws = extract_items(payload)
             if not raws:
                 if page == 0:
+                    # "response keys" alone was not enough to diagnose this the
+                    # first time: a geolocated-empty result and a genuine schema
+                    # change both look like {'data','meta','stats'}. The section
+                    # type distinguishes them — a well-formed but empty
+                    # organic_search_results means the query matched nothing
+                    # where the server thinks we are, not that parsing broke.
+                    section = _first(payload, "data.section") or {}
                     log.warning(
-                        "No items parsed for %r — response keys: %s",
+                        "No items parsed for %r — keys=%s section_type=%s "
+                        "params=%s. A well-formed empty section usually means "
+                        "the request geolocated outside the marketplace; check "
+                        "that a time_filter is being sent.",
                         keywords,
                         list(payload)[:8] if isinstance(payload, dict) else type(payload),
+                        section.get("type") if isinstance(section, dict) else None,
+                        {k: v for k, v in params.items() if k != "next_page"},
                     )
                 return
 

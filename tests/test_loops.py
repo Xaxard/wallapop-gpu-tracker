@@ -620,3 +620,40 @@ def test_listings_are_written_before_their_observations(wire):
     assert order.index("listing_states") < order.index("upsert_listings")
     assert order.index("upsert_listings") < order.index("insert_changed_observations")
     assert len(db.observations) == 1
+
+
+# ------------------------------------------------------------ dead-man switch
+def _empty_run():
+    return {"items_seen": 0, "alerts_sent": 0, "errors": 0, "finished_at": "x"}
+
+
+def test_dead_man_fires_after_consecutive_empty_runs(wire):
+    """The comps loop returned 0 items on all 40 searches, hourly, for over a
+    day, and nothing surfaced it — because only the alert loop was covered."""
+    db = FakeDB([ALERT_SEARCH], PRICES, runs=[_empty_run()] * config.DEAD_MAN_RUNS)
+    tg = wire(alert_loop, db, [])
+
+    alert_loop.run_once()
+    assert tg.errors, "a run of empty passes must raise the alarm"
+    assert "zero" in tg.errors[0].lower()
+
+
+def test_dead_man_stays_quiet_while_items_are_flowing(wire):
+    healthy = dict(_empty_run(), items_seen=120)
+    db = FakeDB([ALERT_SEARCH], PRICES, runs=[healthy] * config.DEAD_MAN_RUNS)
+    tg = wire(alert_loop, db, [make_item("d1", "RTX 3070 Gigabyte OC", 180.0)])
+
+    alert_loop.run_once()
+    assert tg.errors == []
+
+
+def test_comps_loop_is_covered_by_the_dead_man_switch(wire):
+    """The regression that actually happened: the check existed, but only the
+    alert loop called it."""
+    search = dict(ALERT_SEARCH, role="comps", label="Comps RTX 3070")
+    db = FakeDB([search], PRICES, runs=[_empty_run()] * config.DEAD_MAN_RUNS)
+    tg = wire(comps_loop, db, [])
+
+    comps_loop.run_once()
+    assert tg.errors, "comps must raise the alarm too"
+    assert "comps" in tg.errors[0]

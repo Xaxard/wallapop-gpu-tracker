@@ -358,22 +358,31 @@ def run_once() -> dict:
         telegram.close()
 
 
-def _check_dead_man(db: Database, telegram: Telegram) -> None:
-    """Warn when the bot has gone quiet rather than actually broken.
+def _check_dead_man(db: Database, telegram: Telegram, loop_name: str = "alert") -> None:
+    """Warn when a loop has gone quiet rather than actually broken.
 
-    The realistic failure here is silent, not loud: Wallapop changes the
-    response shape, parsing yields an empty list, every run still "succeeds"
-    with nothing to report, and the feed simply stops. Without this the first
-    signal is noticing weeks later that no alert ever arrived.
+    The realistic failure here is silent, not loud: a request starts coming
+    back well-formed but empty, parsing yields nothing, every run still
+    "succeeds" with nothing to report, and the loop simply stops doing its job.
+
+    This is not hypothetical. The comps loop returned 0 items on all 40 of its
+    searches, every hour, for over a day — because it was the only loop *not*
+    covered by this check. Nothing surfaced it; the alert feed looked normal
+    because a separate code path was still feeding the comps pool. Both loops
+    are covered now.
     """
-    runs = db.recent_runs("alert", config.DEAD_MAN_RUNS)
+    runs = db.recent_runs(loop_name, config.DEAD_MAN_RUNS)
     if len(runs) < config.DEAD_MAN_RUNS:
         return
     if all(int(r.get("items_seen") or 0) == 0 for r in runs):
-        log.error("dead-man switch: %d consecutive runs saw zero items", len(runs))
+        log.error(
+            "dead-man switch: %d consecutive %s runs saw zero items", len(runs), loop_name
+        )
         telegram.send_error(
-            f"{config.DEAD_MAN_RUNS} consecutive alert runs returned zero listings.\n"
-            "The API response shape has probably changed — run smoke_test.py."
+            f"{config.DEAD_MAN_RUNS} consecutive {loop_name} runs returned zero "
+            "listings.\nEither the API response shape changed or the requests are "
+            "geolocating outside the marketplace — run smoke_test.py and check the "
+            "'No items parsed' warnings for the section type."
         )
 
 
