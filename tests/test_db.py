@@ -437,6 +437,73 @@ def test_the_fake_really_enforces_the_unique_index():
         fake.table("junk_exclusions").insert([{"item_id": "j1"}]).execute()
 
 
+def test_log_junk_survives_a_table_with_no_unique_index():
+    """The regression this fix shipped with, caught in production rather than here.
+
+    schema.sql declares the unique index, but `create unique index` fails on a
+    table that already holds duplicate item_ids — which this one did, by
+    millions, which is why the index was wanted. So an apply that looked
+    successful left the index uncreated, and Postgres answered the upsert with
+    42P10. The alert loop crashed on its first run after deploy, every five
+    minutes, because log_junk sits inside the main try of both loops.
+
+    Every existing test passed through this, because the fake honours
+    on_conflict whether or not an index would really exist. So the situation is
+    modelled explicitly: upsert refuses, and log_junk must fall back to the
+    read-then-insert path it used before rather than take the run down.
+    """
+    db, fake = make_db(junk_exclusions=[])
+
+    def _refuse_upsert(name):
+        def boom(_rows, **_kw):
+            raise FakeAPIError(
+                "{'code': '42P10', 'message': 'there is no unique or exclusion "
+                "constraint matching the ON CONFLICT specification'}"
+            )
+        return boom
+
+    class NoUniqueIndex(type(fake)):
+        def table(self, name):
+            handle = super().table(name)
+            if name == "junk_exclusions":
+                handle.upsert = _refuse_upsert(name)
+            return handle
+
+    fake.__class__ = NoUniqueIndex
+    row = {"item_id": "j1", "title": "Funda iPhone 15", "phrase": "funda", "category": "NOT_A_CARD"}
+
+    db.log_junk([row])                       # must not raise
+    assert len(fake.rows["junk_exclusions"]) == 1
+
+    db.log_junk([row])                       # already recorded — read-back skips it
+    assert len(fake.rows["junk_exclusions"]) == 1
+
+    # And it must stop retrying the doomed upsert for the rest of the process.
+    assert db._junk_index_missing is True
+
+
+def test_a_non_42P10_upsert_failure_still_propagates():
+    """The fallback is scoped to the missing-index case. Any other API error is
+    a real failure and must not be swallowed into a silent second write path."""
+    db, fake = make_db(junk_exclusions=[])
+
+    def _connection_failure(_rows, **_kw):
+        raise FakeAPIError("{'code': '08006', 'message': 'connection failure'}")
+
+    class Broken(type(fake)):
+        def table(self, name):
+            handle = super().table(name)
+            if name == "junk_exclusions":
+                handle.upsert = _connection_failure
+            return handle
+
+    fake.__class__ = Broken
+
+    with pytest.raises(FakeAPIError, match="08006"):
+        db.log_junk([{"item_id": "j1", "title": "x", "phrase": "p", "category": "DEFECT"}])
+    assert db._junk_index_missing is False
+
+
 def test_log_junk_collapses_repeats_inside_one_batch():
     """Both loops can see the same listing from two different searches in a
     single pass; sending the id twice in one payload is a 21000 in Postgres."""

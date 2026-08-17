@@ -204,6 +204,24 @@ create table if not exists junk_exclusions (
 -- index and crashed its whole run over a filter-tuning table. Enforcing the
 -- invariant in one place that all writers share is what makes that collision a
 -- no-op instead.
+--
+-- THE DEDUP BELOW IS NOT OPTIONAL, and it is why this file used to appear to
+-- apply cleanly while leaving the index uncreated. `create unique index` fails
+-- on a table that already contains duplicate item_ids — and this table was 97%
+-- duplicates, which is the entire reason the index is wanted. Postgres then
+-- answers the deduplicating upsert with 42P10 ("no unique or exclusion
+-- constraint matching the ON CONFLICT specification"), which took the alert
+-- loop down on the first run after the upsert shipped. db.log_junk now detects
+-- that and falls back, so this is a performance and hygiene fix rather than an
+-- outage, but the fast path stays off until the index exists.
+--
+-- Keeps the newest row per item_id. Safe to re-run: a deduplicated table
+-- deletes nothing, and the index creation is already idempotent.
+delete from junk_exclusions a
+using junk_exclusions b
+where a.item_id = b.item_id
+  and (a.seen_at < b.seen_at or (a.seen_at = b.seen_at and a.id < b.id));
+
 create unique index if not exists junk_exclusions_item_uidx
   on junk_exclusions (item_id);
 create index if not exists junk_exclusions_seen_at_idx

@@ -57,10 +57,10 @@ jobs:
             echo "chain looks dead — reviving"
           fi
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         if: steps.guard.outputs.skip != 'true'
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         if: steps.guard.outputs.skip != 'true'
         with:
           python-version: "3.12"

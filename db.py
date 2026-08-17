@@ -410,19 +410,85 @@ class Database:
         ignore_duplicates makes that collision the no-op it always should have
         been, and removes the read-back round trips (one per 200 ids, every run)
         along with it. Same pattern as record_alert().
+
+        The upsert needs the unique index to exist, and it may not: schema.sql
+        declares it, but `create unique index` fails outright on a table that
+        already holds duplicate item_ids — which this table did, by millions,
+        which is the whole reason the index was added. So an apply that looks
+        successful can silently leave the index uncreated, and Postgres then
+        answers the upsert with 42P10, "no unique or exclusion constraint
+        matching the ON CONFLICT specification".
+
+        That took the alert loop down on the first run after deploy. This is the
+        same class of problem `_upsert_tolerating_drift` exists for — code
+        reaching a database that has not caught up — so it is handled the same
+        way: fall back to the older read-back-and-insert path, once, for the
+        life of the process. That path is racy, but it degrades to a duplicate
+        row in an audit table rather than a crashed run, and it is exactly what
+        this method did before. See the dedup query in schema.sql for how to
+        create the index and get the fast path back.
         """
         if not rows:
             return
         deduped = {r["item_id"]: r for r in rows if r.get("item_id")}
         if not deduped:
             return
-        for batch in chunked(list(deduped.values())):
-            self._upsert_tolerating_drift(
-                "junk_exclusions",
-                list(batch),
-                on_conflict="item_id",
-                ignore_duplicates=True,
-            )
+
+        if not self._junk_index_missing:
+            try:
+                for batch in chunked(list(deduped.values())):
+                    self._upsert_tolerating_drift(
+                        "junk_exclusions",
+                        list(batch),
+                        on_conflict="item_id",
+                        ignore_duplicates=True,
+                    )
+                return
+            except Exception as exc:
+                if "42P10" not in str(exc):
+                    raise
+                self._junk_index_missing = True
+                log.warning(
+                    "junk_exclusions has no unique index on item_id, so the "
+                    "deduplicating upsert is unavailable — falling back to "
+                    "read-then-insert for the rest of this process. Run the "
+                    "dedup + create-index statements in schema.sql to restore "
+                    "it; until then this table can accumulate duplicates."
+                )
+
+        self._log_junk_by_readback(deduped)
+
+    # Set once a 42P10 proves the unique index is absent, so the failing upsert
+    # is attempted at most once per process rather than on every run.
+    _junk_index_missing: bool = False
+
+    def _log_junk_by_readback(self, deduped: dict[str, dict]) -> None:
+        """Pre-index fallback: skip ids already recorded, insert the rest.
+
+        Racy by construction — two loops can both read "absent" and both
+        insert — but without the unique index there is nothing for that race to
+        violate, so the cost is a duplicate audit row rather than an exception.
+        """
+        known: set[str] = set()
+        for batch in chunked(list(deduped), 200):
+            try:
+                res = (
+                    self.c.table("junk_exclusions")
+                    .select("item_id")
+                    .in_("item_id", list(batch))
+                    .limit(PAGE)
+                    .execute()
+                )
+                known.update(r["item_id"] for r in (res.data or []))
+            except Exception as exc:
+                # Better to risk a duplicate than to lose the audit trail.
+                log.warning("junk dedup lookup failed: %s", exc)
+
+        fresh = [row for iid, row in deduped.items() if iid not in known]
+        if not fresh:
+            return
+        for batch in chunked(fresh):
+            self.c.table("junk_exclusions").insert(list(batch)).execute()
 
     def purge_old_junk(self) -> None:
         """Junk rows past the retention horizon.
