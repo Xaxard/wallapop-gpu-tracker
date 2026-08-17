@@ -336,37 +336,6 @@ def _scan(
     return None
 
 
-def _distinct_keys(norm_text: str) -> set[str]:
-    """Every distinct model key `norm_text` resolves to — one per card named.
-
-    Counts *cards*, not pattern hits. Two things would otherwise inflate the
-    count and they are both the same card written once or twice:
-
-      * several registry entries match at the same offset ("4060 ti 16 gb" hits
-        the 16GB entry, the 8GB entry and the generic entry), and
-      * the same card named repeatedly and inconsistently, which is how people
-        actually write descriptions ("RTX 4070 ... la 4070 ... rtx4070").
-
-    So occurrences are grouped by the offset the model number starts at — every
-    registry pattern begins with a distinct 4-digit number, so one offset is
-    always exactly one card — and each group is resolved to its winning entry the
-    same way _scan resolves one: first entry in registry order that matches there
-    and satisfies its VRAM gate. The result is the set of cards the text names.
-    """
-    starts = {hit.start() for _, rx in _COMPILED for hit in rx.finditer(norm_text)}
-    keys: set[str] = set()
-    for start in sorted(starts):
-        for model, rx in _COMPILED:
-            hit = rx.match(norm_text, start)
-            if hit is None:
-                continue
-            if model.vram is not None and extract_vram(norm_text, near=hit.span()) != model.vram:
-                continue
-            keys.add(model.key)
-            break
-    return keys
-
-
 def classify(title: str | None, description: str | None = None) -> Match:
     """Map a listing to a model — title first, description only as a last resort.
 
@@ -379,34 +348,37 @@ def classify(title: str | None, description: str | None = None) -> Match:
     modelo" style titles returned NO_MATCH, which made the listing unpriceable
     and therefore silent — and a vague title correlates with a seller who does
     not know what they have, which is exactly the population worth buying from.
-    An *unambiguous* description — one that names a single card, however many
-    times and however inconsistently — is capped at 'medium': still priceable,
-    but structurally unable to outrank a title.
+    Every description-only match is capped at 'low', which Match.priceable
+    refuses, so it can never reach the margin engine. It shipped at 'medium'
+    (priceable) and the first live run produced three alerts, all three wrong,
+    all three from this path:
 
-    A description naming *more than one* card is capped at 'low', which
-    Match.priceable refuses, so it can never reach the margin engine. This branch
-    exists to recover listings whose seller did not put the model in the title,
-    and the value in those is precisely that the seller does not know what they
-    have. A description listing several different cards is a different animal —
-    a bundle, a parts list, a spec sheet, a "compatible con" blurb — and there is
-    no reliable way to tell which one is for sale. Ambiguity should cost the match
-    its priceability rather than resolve to the most expensive candidate, which is
-    what the earlier first-registry-hit rule did: because the registry is ordered
-    newest-first, the highest-tier card named always won, so the rule was
-    systematically biased toward inventing bargains.
+        "Tarjeta Gráfica MSI GeForce GTX 1660"  -> priced as an RTX 3060
+        "Samsung OLED S93F 48 4K TV"            -> priced as an RTX 5080
+        "Nvlink P3651 NVIDIA"                   -> priced as an RTX 3090
 
-    That bias was not covered by any downstream guard. MIN_PLAUSIBLE_RATIO only
-    catches gross mismatches — a 150 EUR card against a 1200 EUR 4090 reference
-    is below 0.35*ref and is rejected — but adjacent-tier confusion, the common
-    case, sails through: a 300 EUR card whose description also names a 4070 Ti
-    Super (seed 520) sits well above 0.35*520 = 182, its 240 EUR offer clears the
-    ~392 ceiling, and it alerts as a strong deal.
+    An earlier guard capped only descriptions naming *several* cards, on the
+    theory that a single named card was reliable evidence. Those three each name
+    exactly one, which is the refutation: a description mentioning one model is
+    not evidence the listing is that model. It is a comparison ("rinde como una
+    3060"), a compatibility note, a bridge that connects two of them, or another
+    listing the seller is cross-selling. And the title — which does name the real
+    product — was ignored precisely because it matched nothing in the registry.
 
-    The key from the winning registry entry is still returned on an ambiguous
-    description, so logs and same_family() see what was recognised; it is the
-    confidence, and therefore the pricing, that is withheld. A title match is
-    unaffected in every case, and so is a single-model description.
-    """
+    No downstream guard covers this. MIN_PLAUSIBLE_RATIO only catches gross
+    mismatches; adjacent-tier confusion, the common case, sails through: a 300
+    EUR listing described as a 4070 Ti Super (seed 520) sits well above
+    0.35*520 = 182, its 240 EUR offer clears the ~392 ceiling, and it reads as a
+    strong deal.
+
+    Making this priceable again needs a title that names some *other*
+    identifiable product to veto the description outright — a notion of "this
+    title names a thing" the registry alone cannot express, since the registry
+    knows only GPUs and these titles were TVs and cables. Until that exists the
+    match is kept for observability and denied the margin engine. The winning
+    key is still returned, so logs and same_family() see what was recognised; it
+    is the confidence, and therefore the pricing, that is withheld. A title match
+    is     """
     norm_title = normalise(title)
     if not norm_title:
         return NO_MATCH
@@ -428,11 +400,30 @@ def classify(title: str | None, description: str | None = None) -> Match:
         # One card named in the description may price the listing; several may
         # not. See the docstring for why ambiguity is resolved by withholding
         # priceability rather than by picking a candidate.
-        unambiguous = len(_distinct_keys(norm_desc)) <= 1
+        # Capped at 'low' — recognised, never priced. This branch shipped at
+        # 'medium' (priceable) and the first live run produced three alerts,
+        # all three of them wrong, all three from exactly this path:
+        #
+        #   "Tarjeta Gráfica MSI GeForce GTX 1660"  -> priced as an RTX 3060
+        #   "Samsung OLED S93F 48 4K TV"            -> priced as an RTX 5080
+        #   "Nvlink P3651 NVIDIA"                   -> priced as an RTX 3090
+        #
+        # The single-model ambiguity guard did not help, because each of those
+        # descriptions names exactly one card. That is the real lesson: a
+        # description mentioning one model is not evidence the listing *is* that
+        # model. It is a comparison ("rinde como una 3060"), a compatibility
+        # note, a bridge for two of them, or the seller's other listing — and
+        # the title, which does name the actual product, was ignored precisely
+        # because it failed to match anything in the registry.
+        #
+        # A title that names some *other* identifiable product should veto the
+        # description outright, which needs a notion of "this title names a
+        # thing" that the registry alone cannot express. Until that exists the
+        # match is kept for observability and denied the margin engine.
         match = _scan(
             norm_desc,
             brand_text=f"{norm_title} {norm_desc}",
-            ceiling="medium" if unambiguous else "low",
+            ceiling="low",
         )
         if match is not None:
             return match

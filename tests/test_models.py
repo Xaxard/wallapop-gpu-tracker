@@ -198,28 +198,35 @@ def test_vram_proximity_does_not_disturb_the_pc_bundle_case():
 
 
 # ------------------------------------------------- model named in the description
-def test_model_named_only_in_the_description_is_matched():
-    """A vague title used to return NO_MATCH, which made the listing unpriceable
-    and therefore silent — and a seller who can't name their card in the title is
-    exactly the seller worth buying from."""
+def test_model_named_only_in_the_description_is_recognised_but_not_priced():
+    """A vague title still gets its model recognised, so the listing is visible
+    in logs and to same_family(). It is deliberately NOT priceable.
+
+    This branch shipped priceable and the first live run produced three alerts,
+    all wrong, all from here — a GTX 1660 priced as an RTX 3060, a Samsung TV as
+    an RTX 5080, an NVLink bridge as an RTX 3090. A description naming one card
+    is not evidence the listing is that card.
+    """
     match = models.classify(
         "Tarjeta grafica Nvidia en perfecto estado",
         "Es una RTX 4070 Ti de MSI, comprada en 2024, con caja",
     )
     assert match.model_key == "rtx_4070_ti"
-    assert match.priceable
+    assert match.confidence == "low"
+    assert not match.priceable
 
 
-def test_a_description_match_is_capped_at_medium_confidence():
+def test_a_description_match_is_capped_at_low_confidence():
     """Even with unambiguous branding in the description, a description match
-    must stay below a title match: 'medium' prices it but can never outrank."""
+    stays below priceable. Strong branding is what made the live false positives
+    convincing, not what made them correct."""
     match = models.classify(
         "Componente de ordenador, en buen estado",
         "Nvidia GeForce RTX 4070 Super, tarjeta grafica de 12 GB",
     )
     assert match.model_key == "rtx_4070_super"
-    assert match.confidence == "medium"
-    assert match.priceable
+    assert match.confidence == "low"
+    assert not match.priceable
 
 
 def test_a_title_match_always_beats_the_description():
@@ -266,30 +273,28 @@ def test_the_adjacent_tier_false_positive_shape_is_unpriceable():
     assert not match.priceable
 
 
-def test_a_description_naming_one_card_several_ways_is_still_priceable():
-    """The cap counts distinct *cards*, not pattern hits. People name the same
-    card repeatedly and inconsistently inside one description, and several
-    registry entries match at one offset anyway — neither is ambiguity."""
+def test_a_description_naming_one_card_several_ways_still_resolves_to_that_card():
+    """People name the same card repeatedly and inconsistently. The key resolved
+    must be that one card — it drives logging and same_family() — even though
+    nothing from a description is priceable any more."""
     match = models.classify(
         "Componente de ordenador, recogida en Madrid",
         "Vendo RTX 4070. La 4070 esta como nueva, rtx4070 con su caja original.",
     )
     assert match.model_key == "rtx_4070"
-    assert match.confidence == "medium"
-    assert match.priceable
+    assert not match.priceable
 
 
-def test_split_vram_entries_at_one_offset_are_one_card_not_three():
-    """"4060 ti 16 gb" matches the 16GB, 8GB and generic registry entries at the
-    same offset. Counting hits instead of cards would make every split-VRAM
-    description ambiguous and unpriceable."""
+def test_a_split_vram_description_still_resolves_to_the_right_variant():
+    """"4060 ti 16 gb" matches the 16GB, 8GB and generic entries at one offset;
+    the most specific must win, so the key recorded against the listing is the
+    16GB variant rather than the generic pool."""
     match = models.classify(
         "Grafica Nvidia en venta",
         "Es una RTX 4060 Ti de 16 GB, modelo Gigabyte Eagle",
     )
     assert match.model_key == "rtx_4060_ti_16g"
-    assert match.confidence == "medium"
-    assert match.priceable
+    assert not match.priceable
 
 
 def test_a_title_match_is_unaffected_by_extra_models_in_the_description():
