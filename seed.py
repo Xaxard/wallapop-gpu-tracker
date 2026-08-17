@@ -15,30 +15,7 @@ from db import Database, now
 log = logging.getLogger("seed")
 
 GPU = config.CATEGORY_GPU
-PHONE = config.CATEGORY_PHONE
 RADIUS = config.DEFAULT_DISTANCE_KM
-
-# iPhone 15 onwards, the whole current lineup as of August 2026. The 18 series
-# does not exist yet (September 2026), and the Plus was retired after the 16 in
-# favour of the Air. Bootstrap caps sit near the p25 of live asking prices, so
-# they only ever matter on day one — the learned buy_ceiling takes over as soon
-# as a model has real comps.
-IPHONE_MODELS = [
-    ("iphone_15", "iphone 15", 400),
-    ("iphone_15_plus", "iphone 15 plus", 450),
-    ("iphone_15_pro", "iphone 15 pro", 500),
-    ("iphone_15_pro_max", "iphone 15 pro max", 500),
-    ("iphone_16e", "iphone 16e", 420),
-    ("iphone_16", "iphone 16", 550),
-    ("iphone_16_plus", "iphone 16 plus", 550),
-    ("iphone_16_pro", "iphone 16 pro", 600),
-    ("iphone_16_pro_max", "iphone 16 pro max", 700),
-    ("iphone_17e", "iphone 17e", 580),
-    ("iphone_17", "iphone 17", 700),
-    ("iphone_17_pro", "iphone 17 pro", 900),
-    ("iphone_17_pro_max", "iphone 17 pro max", 900),
-    ("iphone_air", "iphone air", 700),
-]
 
 # ---------------------------------------------------------------- §7 config
 # Deal-alert searches. max_price is only a coarse API-side filter to keep the
@@ -82,14 +59,6 @@ DISCOVERY_SEARCHES = [
     ("Discovery GPU", "gpu"),
     ("Discovery Tarjeta Grafica", "tarjeta grafica"),
     ("Discovery Grafica", "grafica"),
-]
-
-# Phone discovery. "iphone" alone returns a torrent of cases and chargers, but
-# _relevant() requires an identifiable model and the junk rules drop accessories
-# by their leading noun, so what survives is handsets the model searches missed.
-PHONE_DISCOVERY_SEARCHES = [
-    ("Discovery iPhone", "iphone"),
-    ("Discovery Apple movil", "apple movil"),
 ]
 
 # GPU only — no other product categories tracked.
@@ -203,24 +172,6 @@ SEED_PRICES = {
     "rx_9060_xt": 280,
     "rx_9070": 480,
     "rx_9070_xt": 550,
-    # iPhones. Set near the 25th percentile of live asking prices sampled
-    # 2026-08-02, not the median: asking prices are aspirational, and a seed
-    # that is too high inflates the buy ceiling and manufactures fake deals on
-    # day one. These only hold until each model has MIN_COMPS real comps.
-    "iphone_15": 395,
-    "iphone_15_plus": 440,
-    "iphone_15_pro": 500,
-    "iphone_15_pro_max": 490,
-    "iphone_16e": 415,
-    "iphone_16": 550,
-    "iphone_16_plus": 550,
-    "iphone_16_pro": 600,
-    "iphone_16_pro_max": 700,
-    "iphone_17e": 580,
-    "iphone_17": 700,
-    "iphone_17_pro": 930,
-    "iphone_17_pro_max": 880,
-    "iphone_air": 700,
 }
 
 
@@ -266,47 +217,6 @@ def build_search_rows() -> list[dict]:
                 "keywords": keywords,
                 "model_key": model_key,
                 "category_ids": GPU,
-                "max_price": None,
-                "distance_km": None,
-                "active": True,
-            }
-        )
-
-    # ------------------------------------------------------------- iPhones
-    for model_key, keywords, cap in IPHONE_MODELS:
-        rows.append(
-            {
-                "label": f"Alert {keywords.upper()}",
-                "role": "alert",
-                "keywords": keywords,
-                "model_key": model_key,
-                "category_ids": PHONE,
-                "max_price": cap,
-                "distance_km": None,
-                "active": True,
-            }
-        )
-        rows.append(
-            {
-                "label": f"Comps {keywords.upper()}",
-                "role": "comps",
-                "keywords": keywords,
-                "model_key": model_key,
-                "category_ids": PHONE,
-                "max_price": None,
-                "distance_km": None,
-                "active": True,
-            }
-        )
-
-    for label, keywords in PHONE_DISCOVERY_SEARCHES:
-        rows.append(
-            {
-                "label": label,
-                "role": "alert",
-                "keywords": keywords,
-                "model_key": None,
-                "category_ids": PHONE,
                 "max_price": None,
                 "distance_km": None,
                 "active": True,

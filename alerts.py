@@ -138,11 +138,6 @@ def build_caption(
     brand = getattr(item, "brand", None)
     if brand:
         detail_bits.append(f"Marca: {html.escape(str(brand))}")
-    # Storage is the single biggest price lever on a phone, so it belongs next
-    # to the condition rather than buried in the title.
-    storage = getattr(item, "storage", None)
-    if storage:
-        detail_bits.append(f"Capacidad: {html.escape(str(storage).upper())}")
     age = _age_str(getattr(item, "age_seconds", None))
     if age:
         detail_bits.append(f"Publicado {age}")

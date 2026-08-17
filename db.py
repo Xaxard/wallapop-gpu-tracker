@@ -30,6 +30,16 @@ def iso(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).isoformat()
 
 
+def _num_eq(a: Any, b: Any) -> bool:
+    """Numeric equality across the str/Decimal/float mix PostgREST returns."""
+    if a is None or b is None:
+        return a is None and b is None
+    try:
+        return abs(float(a) - float(b)) < 0.005
+    except (TypeError, ValueError):
+        return False
+
+
 def chunked(seq: Sequence[Any], size: int = 500) -> Iterable[Sequence[Any]]:
     for i in range(0, len(seq), size):
         yield seq[i : i + size]
@@ -131,6 +141,34 @@ class Database:
     def insert_observations(self, rows: list[dict]) -> None:
         for batch in chunked(rows):
             self.c.table("observations").insert(list(batch)).execute()
+
+    def insert_changed_observations(self, rows: list[dict]) -> int:
+        """Record only the observations that say something new.
+
+        An observation exists to capture a *change* — a price cut, or a listing
+        going reserved. Writing one every pass regardless meant a listing that
+        sat untouched for three weeks produced ~6000 identical rows, and the
+        comps pool then had to dedup them right back down to one price per item
+        anyway. It is the same waste that made junk_exclusions 97% of the
+        database, just slower.
+
+        Skipping unchanged rows loses nothing downstream: collect_comps takes
+        one price per item, and last_reserved_price takes the newest reserved
+        row — both of which the change-only trail still answers exactly.
+        """
+        if not rows:
+            return 0
+        previous = self.get_listings([r["item_id"] for r in rows])
+        fresh = []
+        for row in rows:
+            prior = previous.get(row["item_id"])
+            if prior is not None:
+                same_price = _num_eq(prior.get("last_price"), row.get("price"))
+                if same_price and prior.get("last_status") == row.get("status"):
+                    continue
+            fresh.append(row)
+        self.insert_observations(fresh)
+        return len(fresh)
 
     def reserved_comps(self, model_key: str, since: datetime) -> list[dict]:
         """Reserved observations for a model inside the trailing window."""
@@ -264,10 +302,98 @@ class Database:
 
     # ------------------------------------------------------------- auditing
     def log_junk(self, rows: list[dict]) -> None:
+        """Record why a listing was excluded, at most once per listing.
+
+        This table exists to tune the filters, so one row per exclusion is all
+        it was ever meant to hold. Plain inserts made it one row per exclusion
+        *per run*: the same "Funda iPhone 15" was re-logged every five minutes
+        for as long as it stayed listed, ~288 times a day. It reached 2.86M
+        rows in 16 days — 97% of the database and the reason the free-tier
+        quota ran out — while carrying only a few thousand distinct listings.
+
+        Dedup is done by reading back which listings are already recorded
+        rather than by an upsert, so it needs no unique index and works against
+        the existing table immediately — the same shape as alerted_prices().
+        """
         if not rows:
             return
-        for batch in chunked(rows):
+        deduped = {r["item_id"]: r for r in rows if r.get("item_id")}
+        if not deduped:
+            return
+
+        known: set[str] = set()
+        for batch in chunked(list(deduped), 200):
+            try:
+                res = (
+                    self.c.table("junk_exclusions")
+                    .select("item_id")
+                    .in_("item_id", list(batch))
+                    .limit(PAGE)
+                    .execute()
+                )
+                known.update(r["item_id"] for r in (res.data or []))
+            except Exception as exc:
+                # Better to risk a duplicate than to lose the audit trail.
+                log.warning("junk dedup lookup failed: %s", exc)
+
+        fresh = [row for iid, row in deduped.items() if iid not in known]
+        if not fresh:
+            return
+        for batch in chunked(fresh):
             self.c.table("junk_exclusions").insert(list(batch)).execute()
+
+    def purge_old_junk(self) -> None:
+        """Junk rows past the retention horizon.
+
+        Even deduplicated this grows with every new listing the filters reject,
+        and nothing reads a months-old exclusion — the phrase lists get tuned
+        against what the filters are catching now.
+        """
+        self._purge_before(
+            "junk_exclusions", now() - timedelta(days=config.JUNK_RETENTION_DAYS)
+        )
+
+    def _purge_before(self, table: str, cutoff: datetime, *, slice_hours: int = 6) -> None:
+        """Delete `table` rows older than `cutoff`, in time slices.
+
+        A single `delete where seen_at < cutoff` is the obvious implementation
+        and it does not survive contact with a real backlog: Postgres cancels
+        it on the statement timeout (57014) and *nothing* gets deleted, so the
+        table only grows and every subsequent run fails the same way. Slicing
+        keeps each statement small enough to commit, and bounding the number of
+        slices per run stops housekeeping from monopolising a cycle — a
+        backlog then drains over several runs instead of never.
+        """
+        oldest = self._oldest(table)
+        if oldest is None:
+            return
+        window = timedelta(hours=slice_hours)
+        start = oldest
+        for _ in range(200):  # bounded work per run
+            if start >= cutoff:
+                return
+            end = min(start + window, cutoff)
+            try:
+                self.c.table(table).delete().lt("seen_at", iso(end)).gte(
+                    "seen_at", iso(start)
+                ).execute()
+            except Exception as exc:
+                log.warning("%s purge slice %s failed: %s", table, start, exc)
+                return
+            start = end
+
+    def _oldest(self, table: str) -> datetime | None:
+        try:
+            res = (
+                self.c.table(table).select("seen_at").order("seen_at").limit(1).execute()
+            )
+            rows = res.data or []
+            if not rows:
+                return None
+            return datetime.fromisoformat(str(rows[0]["seen_at"]).replace("Z", "+00:00"))
+        except Exception as exc:
+            log.warning("%s oldest-row lookup failed: %s", table, exc)
+            return None
 
     def purge_old_observations(self) -> None:
         """Keep `observations` inside the free-tier storage budget.
@@ -277,11 +403,9 @@ class Database:
         comps window is ever read, so anything past the retention horizon is
         pure cost.
         """
-        cutoff = iso(now() - timedelta(days=config.OBSERVATION_RETENTION_DAYS))
-        try:
-            self.c.table("observations").delete().lt("seen_at", cutoff).execute()
-        except Exception as exc:  # housekeeping must never break a run
-            log.warning("observation purge failed: %s", exc)
+        self._purge_before(
+            "observations", now() - timedelta(days=config.OBSERVATION_RETENTION_DAYS)
+        )
 
     def recent_runs(self, loop_name: str, limit: int) -> list[dict]:
         """Last N finished runs, newest first — input to the dead-man switch."""

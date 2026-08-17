@@ -58,6 +58,7 @@ class FakeDB:
         self._open = open_listings or []
         self._runs = runs or []
         self.purged = False
+        self.junk_purged = False
         self.listings = []
         self.observations = []
         self.recorded = []
@@ -87,6 +88,27 @@ class FakeDB:
 
     def insert_observations(self, rows):
         self.observations.extend(rows)
+
+    def get_listings(self, item_ids):
+        wanted = set(item_ids)
+        return {r["item_id"]: r for r in self.listings if r["item_id"] in wanted}
+
+    def insert_changed_observations(self, rows):
+        """Mirrors Database.insert_changed_observations: only rows whose price
+        or status differs from the stored listing are kept."""
+        previous = self.get_listings([r["item_id"] for r in rows])
+        fresh = []
+        for row in rows:
+            prior = previous.get(row["item_id"])
+            if (
+                prior is not None
+                and prior.get("last_price") == row.get("price")
+                and prior.get("last_status") == row.get("status")
+            ):
+                continue
+            fresh.append(row)
+        self.observations.extend(fresh)
+        return len(fresh)
 
     def alerted_prices(self, ids):
         return {k: v for k, v in self._alerted.items() if k in set(ids)}
@@ -124,6 +146,9 @@ class FakeDB:
 
     def purge_old_observations(self):
         self.purged = True
+
+    def purge_old_junk(self):
+        self.junk_purged = True
 
     def recent_runs(self, loop_name, limit):
         return self._runs[:limit]
@@ -511,60 +536,53 @@ def test_never_reserved_item_closes_without_a_sold_price():
     assert db.closed["s3"] is None
 
 
-# ------------------------------------------------------- per-family price cap
-PHONE_SEARCH = {
-    "label": "Alert IPHONE 15 PRO",
-    "role": "alert",
-    "keywords": "iphone 15 pro",
-    "model_key": "iphone_15_pro",
-    "category_ids": config.CATEGORY_PHONE,
-    "max_price": 500,
-    "distance_km": None,
-}
-
-PHONE_PRICES = {
-    "iphone_15_pro": {
-        "model_key": "iphone_15_pro",
-        "ref_price": 500.0,
-        "buy_ceiling": 414.0,
-        "buy_ceiling_in_person": 450.0,
-        "n_comps": 11,
-        "is_seed": False,
-    }
-}
-
-
-def test_phone_priced_above_the_gpu_cap_still_alerts(wire):
-    """The GPU cap is 350 and a used iPhone 15 Pro is ~550, so a single global
-    cap would silently mute the entire phone category rather than filter it."""
-    db = FakeDB([PHONE_SEARCH], PHONE_PRICES)
-    tg = wire(alert_loop, db, [make_item("p1", "iPhone 15 Pro 128GB Titanio", 480.0)])
-
-    stats = alert_loop.run_once()
-    assert stats["over_cap"] == 0
-    assert stats["alerts_sent"] == 1
-    assert tg.sent[0][2] == 480.0
-
-
-def test_phone_above_its_own_cap_does_not_alert(wire):
-    db = FakeDB([PHONE_SEARCH], PHONE_PRICES)
-    # Same model as the search, so it survives _relevant() and the cap is what
-    # actually stops it — a Pro Max here would be filtered as irrelevant first
-    # and the test would pass for the wrong reason.
-    tg = wire(alert_loop, db, [make_item("p2", "iPhone 15 Pro 1TB", 1400.0)])
-
-    stats = alert_loop.run_once()
-    assert stats["over_cap"] == 1
-    assert stats["alerts_sent"] == 0
-    assert tg.sent == []
-
-
-def test_gpu_cap_is_unchanged_by_the_phone_cap(wire):
-    """A 400 EUR card is still over the GPU ceiling even though it sits well
-    under the phone one — the cap follows the family, not the listing."""
+# ------------------------------------------------- storage-growth regressions
+def test_unchanged_listing_writes_no_second_observation(wire):
+    """The bug that exhausted the database, in miniature. An observation exists
+    to capture a change; writing one every pass meant a listing sitting
+    untouched for weeks produced thousands of identical rows that the comps
+    pool then deduped straight back down to one price per item."""
     db = FakeDB([ALERT_SEARCH], PRICES)
-    tg = wire(alert_loop, db, [make_item("g1", "RTX 3070 Gigabyte OC", 400.0)])
+    item = make_item("s1", "RTX 3070 Gigabyte OC", 180.0)
+    wire(alert_loop, db, [item])
 
-    stats = alert_loop.run_once()
-    assert stats["over_cap"] == 1
-    assert tg.sent == []
+    alert_loop.run_once()
+    first = len(db.observations)
+    assert first == 1
+
+    alert_loop.run_once()          # same listing, same price, same status
+    assert len(db.observations) == first, "an unchanged listing must not re-observe"
+
+
+def test_a_price_change_still_records_an_observation(wire):
+    db = FakeDB([ALERT_SEARCH], PRICES)
+    wire(alert_loop, db, [make_item("s2", "RTX 3070 Gigabyte OC", 180.0)])
+    alert_loop.run_once()
+    assert len(db.observations) == 1
+
+    wire(alert_loop, db, [make_item("s2", "RTX 3070 Gigabyte OC", 150.0)])
+    alert_loop.run_once()
+    assert len(db.observations) == 2
+    assert db.observations[-1]["price"] == 150.0
+
+
+def test_a_status_change_still_records_an_observation(wire):
+    db = FakeDB([ALERT_SEARCH], PRICES)
+    wire(alert_loop, db, [make_item("s3", "RTX 3070 Gigabyte OC", 180.0)])
+    alert_loop.run_once()
+
+    wire(alert_loop, db, [make_item("s3", "RTX 3070 Gigabyte OC", 180.0, reserved=True)])
+    alert_loop.run_once()
+    assert db.observations[-1]["status"] == "reserved"
+
+
+def test_comps_loop_sweeps_both_retention_tables(wire):
+    """junk_exclusions is the table that actually blew the quota — 2.86M rows
+    in 16 days — so its sweep has to run, not just the observations one."""
+    search = dict(ALERT_SEARCH, role="comps", label="Comps RTX 3070")
+    db = FakeDB([search], PRICES)
+    wire(comps_loop, db, [make_item("c1", "RTX 3070 Gigabyte OC", 180.0)])
+
+    comps_loop.run_once()
+    assert db.purged, "observations retention did not run"
+    assert db.junk_purged, "junk retention did not run"

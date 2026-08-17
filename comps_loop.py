@@ -122,7 +122,7 @@ def run_once() -> dict:
 
     db = Database()
     run_id = db.start_run("comps")
-    stats = {"items_seen": 0, "closed": 0, "models_updated": 0, "errors": 0}
+    stats = {"items_seen": 0, "closed": 0, "models_updated": 0, "errors": 0, "observations": 0}
     telegram = Telegram()
 
     try:
@@ -184,17 +184,16 @@ def run_once() -> dict:
                 reserved_rows.append(row)
             else:
                 active_rows.append(row)
-        if reserved_rows:
-            db.upsert_listings(reserved_rows)
-        if active_rows:
-            db.upsert_listings(active_rows)
 
+        # Observations compare against the previous listing state, so they are
+        # written before the upserts below replace it.
+        #
         # A whole machine never contributes a model_key, so its price can never
         # reach a comps pool. This is the one place form factor genuinely
         # matters: a prebuilt selling for 900 EUR is a real transaction, just
         # not one in the loose card its title names, and the reference price is
         # the number every buy ceiling is derived from.
-        db.insert_observations(
+        stats["observations"] = db.insert_changed_observations(
             [
                 {
                     "item_id": item.item_id,
@@ -211,6 +210,11 @@ def run_once() -> dict:
                 if item.price is not None
             ]
         )
+
+        if reserved_rows:
+            db.upsert_listings(reserved_rows)
+        if active_rows:
+            db.upsert_listings(active_rows)
 
         # Only models whose searches actually ran this cycle may be judged
         # absent — otherwise a model with no comps search would have all its
@@ -249,6 +253,7 @@ def run_once() -> dict:
 
         # Housekeeping runs on the slow loop so the alert path stays lean.
         db.purge_old_observations()
+        db.purge_old_junk()
 
         log.info(
             "comps done: %d items, %d closed, %d models repriced",

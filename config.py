@@ -45,25 +45,10 @@ DEFAULT_DISTANCE_KM = _i("WP_DEFAULT_DISTANCE_KM", 100)
 # laptops. Category filtering only works client-side, off each item's
 # `taxonomy` array. See TAXONOMY_* below.
 CATEGORY_GPU = "24200"
-CATEGORY_PHONE = "24201"   # "Telefonía: móviles y smartwatches"
 
 # ------------------------------------------------------------ taxonomy leaves
 # Read off /api/v3/categories (verified live 2026-08-02).
 TAXONOMY_COMPONENTS = 10304          # "Componentes y piezas de ordenador"
-TAXONOMY_SMARTPHONES = 9447          # "Smartphones"
-
-# Phone accessories and spare parts live in sibling leaves, never under 9447 —
-# a case, a charger or a replacement battery is a different product that merely
-# names the phone it fits. Listed for reference; the junk rules catch them by
-# phrase, which also works on the many listings filed in the wrong leaf.
-TAXONOMY_PHONE_ACCESSORIES = frozenset({
-    9375,    # Accesorios de móviles y smartwatches
-    10428,   # Fundas y carcasas
-    10423,   # Baterías para móviles
-    10427,   # Cargadores y cables
-    9388,    # Piezas de recambio
-})
-
 # Whole-machine categories. A GPU inside one of these is not a loose card, so
 # its price is not a comp for one.
 #
@@ -99,16 +84,13 @@ class FeeModel:
     def required_margin(self, ref_price: float) -> float:
         """What this flip has to clear, in euros.
 
-        A flat target is wrong for expensive items. TARGET_MARGIN=50 is a 25%
-        return on a 200 EUR card and a 7% return on a 700 EUR phone — the same
-        rule that is demanding on a GPU is trivially satisfied by almost every
-        iPhone listing, which is exactly what happened the first time phones
-        were switched on: 111 alerts in one pass, nearly all of them ordinary
-        listings rather than bargains.
+        A flat target scales badly. TARGET_MARGIN=50 is a 25% return on a
+        200 EUR card and an 8% one on a 620 EUR card — the same rule that is
+        demanding at the cheap end is nearly free at the expensive end, for the
+        same work and the same capital at risk.
 
         So the requirement is whichever is greater: the flat floor, or a
-        percentage of what the item is worth. Capital tied up in a 700 EUR
-        phone should earn proportionally more than capital in a 200 EUR card.
+        percentage of what the item is worth.
         """
         return max(self.target_margin, MARGIN_RATE * ref_price)
 
@@ -134,12 +116,10 @@ TARGET_MARGIN = _f("TARGET_MARGIN", 50.0)
 #
 # The crossover is TARGET_MARGIN / MARGIN_RATE, so at the defaults anything
 # with a reference under ~278 EUR is still governed by the 50 EUR floor exactly
-# as before. Above that the rate binds, which does tighten the existing feed
-# for mid and high-tier cards: a 4070 at ref 330 now has to clear 59 EUR rather
-# than 50, and a 4080 at ref 620 has to clear 112. That is the intended
-# correction — 50 EUR on a 620 EUR card is an 8% return for the same work and
-# the same risk as a 25% one on a 200 EUR card. Set MARGIN_RATE=0 to restore
-# the old flat-only behaviour.
+# as before. Above it the rate binds, which tightens the feed for mid and
+# high-tier cards: a 4070 at ref 330 must clear 59 EUR rather than 50, and a
+# 4080 at ref 620 must clear 112. Set MARGIN_RATE=0 to restore the old
+# flat-only behaviour.
 MARGIN_RATE = _f("MARGIN_RATE", 0.18)
 
 # Extra margin demanded while a model is still priced from its hand-written
@@ -289,32 +269,18 @@ MIN_PLAUSIBLE_RATIO = _f("MIN_PLAUSIBLE_RATIO", 0.35)
 # full distribution to be meaningful.
 MAX_ALERT_PRICE = _f("MAX_ALERT_PRICE", 350.0)
 
-# Phones need their own ceiling. A used iPhone 15 Pro sits around 550 EUR and a
-# 17 Pro Max near 1000, so the GPU cap would silently mute the entire category
-# rather than filter it. This is the one number to change if the capital at
-# risk per phone feels wrong — the margin gate still has to clear underneath.
-MAX_ALERT_PRICE_PHONE = _f("MAX_ALERT_PRICE_PHONE", 900.0)
-
-# Per-family caps, keyed by models.ModelDef.family.
-MAX_ALERT_PRICE_BY_FAMILY = {
-    "gpu": MAX_ALERT_PRICE,
-    "phone": MAX_ALERT_PRICE_PHONE,
-}
-
-
-def max_alert_price(family: str | None) -> float:
-    """Cap for a family, falling back to the strictest one we know.
-
-    An unclassified listing gets the GPU cap rather than the loosest one: a
-    listing we couldn't identify is the last thing that should be handed the
-    most permissive budget.
-    """
-    return MAX_ALERT_PRICE_BY_FAMILY.get(family or "", MAX_ALERT_PRICE)
-
 # ------------------------------------------------------------------- ops
 # observations grows by ~one row per listing per run; at a 5-minute cadence
-# that is ~100k rows/day and will exhaust a free Supabase project.
-OBSERVATION_RETENTION_DAYS = _i("OBSERVATION_RETENTION_DAYS", 90)
+# that is ~100k rows/day and will exhaust a free Supabase project. 90 days was
+# far too generous for that rate — and nothing reads an observation older than
+# COMPS_WINDOW_DAYS anyway, so everything past it is pure storage cost.
+OBSERVATION_RETENTION_DAYS = _i("OBSERVATION_RETENTION_DAYS", 21)
+
+# junk_exclusions is a tuning aid, not a record: the phrase lists get adjusted
+# against what the filters are catching now, never against last month. It is
+# also the table that actually exhausted the free tier — 2.86M rows in 16 days,
+# 97% of the database — so it gets the shortest horizon of anything here.
+JUNK_RETENTION_DAYS = _i("JUNK_RETENTION_DAYS", 7)
 
 # Consecutive runs returning zero items before the bot reports itself broken.
 # The realistic failure is silent: the API changes shape, parsing yields [],

@@ -127,6 +127,17 @@ create table if not exists junk_exclusions (
   seen_at    timestamptz default now()
 );
 
+-- One row per listing, not one per listing per run. Without this the same
+-- exclusion was re-inserted every 5 minutes for as long as the listing stayed
+-- up (~288 rows/day each), which reached 2.86M rows in 16 days and exhausted
+-- the free-tier quota. db.log_junk() also dedups client-side, so this index is
+-- belt-and-braces rather than the only guard — but it is what makes the
+-- invariant true regardless of which process is writing.
+create unique index if not exists junk_exclusions_item_uidx
+  on junk_exclusions (item_id);
+create index if not exists junk_exclusions_seen_at_idx
+  on junk_exclusions (seen_at);
+
 -- ------------------------------------------------------- [ext] run history
 create table if not exists run_log (
   id           bigint generated always as identity primary key,

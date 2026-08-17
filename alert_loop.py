@@ -48,8 +48,6 @@ def _listing_row(item: Item, match: models.Match) -> dict:
         "whole_machine": item.whole_machine,
         "posted_at": iso(item.posted_at) if item.posted_at else None,
         "user_allows_shipping": item.user_allows_shipping,
-        "family": match.family,
-        "storage": match.storage or item.storage,
     }
 
 
@@ -65,9 +63,7 @@ def _relevant(search: dict, match: models.Match) -> bool:
     if model_key:
         return models.same_family(model_key, match.model_key)
     if search.get("category_ids"):
-        # Broad discovery searches: must at least be an identifiable product.
-        # Any category, not just the GPU one — phone discovery has exactly the
-        # same problem, and "iphone" as a keyword returns cases and chargers.
+        # Broad discovery searches: must at least be an identifiable card.
         return match.model_key is not None
     # Bare keyword watches with no category stay plain keyword matches.
     return True
@@ -89,7 +85,7 @@ def _enrich(wp: WallapopClient, item: Item) -> Item:
         return item
     if detail is None:
         return item
-    for field in ("condition", "brand", "user_allows_shipping", "api_model", "storage"):
+    for field in ("condition", "brand", "user_allows_shipping"):
         value = getattr(detail, field, None)
         if value is not None:
             setattr(item, field, value)
@@ -203,29 +199,33 @@ def run_once() -> dict:
         # Record everything we saw, reserved included — the alert loop feeds the
         # comps pool too, and its 5-minute cadence catches short-lived listings
         # the hourly comps loop would miss entirely.
-        db.upsert_listings([_listing_row(i, m) for i, m, _ in found.values()])
+        # Observations are compared against the *previous* listing state, so
+        # they must be written before the upsert below overwrites last_price
+        # and last_status with what we just saw.
+        #
         # A whole machine's price is recorded but never attributed to a model:
         # a prebuilt that sells for 900 EUR is a real transaction, just not a
         # transaction in the loose card its title happens to name. Nulling the
         # model_key keeps it out of every comps pool at the source, which is
         # the only number that decides a ceiling.
-        db.insert_observations(
-            [
-                {
-                    "item_id": item.item_id,
-                    "model_key": (
-                        match.model_key
-                        if match.priceable and not item.whole_machine
-                        else None
-                    ),
-                    "price": item.price,
-                    "status": item.status,
-                    "seen_at": iso(now()),
-                }
-                for item, match, _ in found.values()
-                if item.price is not None
-            ]
-        )
+        observation_rows = [
+            {
+                "item_id": item.item_id,
+                "model_key": (
+                    match.model_key
+                    if match.priceable and not item.whole_machine
+                    else None
+                ),
+                "price": item.price,
+                "status": item.status,
+                "seen_at": iso(now()),
+            }
+            for item, match, _ in found.values()
+            if item.price is not None
+        ]
+        stats["observations"] = db.insert_changed_observations(observation_rows)
+
+        db.upsert_listings([_listing_row(i, m) for i, m, _ in found.values()])
 
         # Reserved listings price the market but you can't buy them.
         #
@@ -235,27 +235,22 @@ def run_once() -> dict:
         # laptops in the alert path at all — a machine with a card in it is
         # essentially never listed this cheap, so the cap filters them out on
         # price without ever having to guess at form factor from a title.
-        def _under_cap(item: Item, match: models.Match) -> bool:
-            # The cap is per family: a used iPhone 15 Pro sits near 550 EUR, so
-            # the GPU ceiling would mute the entire phone category rather than
-            # filter it.
-            return float(item.price) <= config.max_alert_price(match.family)
-
         candidates = {
             iid: v
             for iid, v in found.items()
-            if not v[0].reserved and v[0].price is not None and _under_cap(v[0], v[1])
+            if not v[0].reserved
+            and v[0].price is not None
+            and float(v[0].price) <= config.MAX_ALERT_PRICE
         }
         over_cap = sum(
             1
             for v in found.values()
-            if v[0].price is not None and not _under_cap(v[0], v[1])
+            if v[0].price is not None and float(v[0].price) > config.MAX_ALERT_PRICE
         )
         stats["over_cap"] = over_cap
         log.info(
-            "%d candidates within the per-family cap (gpu %.0f / phone %.0f); "
-            "%d listings priced above it",
-            len(candidates), config.MAX_ALERT_PRICE, config.MAX_ALERT_PRICE_PHONE, over_cap,
+            "%d candidates under %.0f EUR (%d listings priced above the cap)",
+            len(candidates), config.MAX_ALERT_PRICE, over_cap,
         )
         already = db.alerted_prices(list(candidates))
         detail_client = WallapopClient()
