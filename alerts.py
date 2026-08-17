@@ -5,7 +5,7 @@ from __future__ import annotations
 import html
 import logging
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -22,6 +22,12 @@ MADRID = ZoneInfo("Europe/Madrid")
 # Telegram truncates photo captions at 1024 characters.
 CAPTION_LIMIT = 1024
 DESC_CHARS = 200
+
+# How much later than `posted_at` a `modified_at` has to be before it counts as
+# a real edit. Wallapop stamps both on creation, and they are not always
+# byte-identical, so a bare inequality would print "edited" on every untouched
+# listing in the feed and the signal would mean nothing.
+MODIFIED_EPSILON_SECONDS = 120
 
 # The API's condition enum, in the words Wallapop itself shows the seller.
 # Printing the raw value ("as_good_as_new") in an alert is noise; an unknown
@@ -66,6 +72,43 @@ def _age_str(seconds: float | None) -> str | None:
     return f"hace {round(hours / 24)} d"
 
 
+def _edited_str(item: Item) -> str | None:
+    """"Seller touched this recently", when the API says they did.
+
+    `modified_at` was parsed off every listing and then read by nothing at all.
+    It is worth a few characters of caption for two reasons the rest of the
+    alert cannot supply:
+
+      * a price cut on a listing that never alerted is otherwise invisible.
+        `_decide_kind` can only compare against our own alert history, so a
+        seller who lists at 400, gets no interest and drops to 260 shows up as a
+        plain "new" match with nothing to say that the price just moved;
+      * a recent edit means a live seller, which is most of whether an offer
+        gets answered at all — the same reason "Publicado hace 4 min" earns its
+        place on the line above.
+
+    Returns None unless the edit is meaningfully later than the listing date, so
+    an untouched listing prints nothing. Read through getattr and guarded
+    against a naive datetime, in the same defensive register as the rest of this
+    file.
+    """
+    modified_at = getattr(item, "modified_at", None)
+    if modified_at is None:
+        return None
+    posted_at = getattr(item, "posted_at", None)
+    try:
+        if (
+            posted_at is not None
+            and (modified_at - posted_at).total_seconds() < MODIFIED_EPSILON_SECONDS
+        ):
+            return None
+        age = (datetime.now(timezone.utc) - modified_at).total_seconds()
+    except TypeError:  # naive/aware mismatch — no usable signal
+        return None
+    phrase = _age_str(age)
+    return f"Editado {phrase}" if phrase else None
+
+
 def build_caption(
     item: Item,
     deal: Deal,
@@ -106,7 +149,24 @@ def build_caption(
         if deal.is_seed:
             margin += "  <i>(seed)</i>"
         elif deal.n_comps:
-            margin += f"  <i>(n={deal.n_comps})</i>"
+            # n_comps is printed as provenance — "this reference rests on 8
+            # transactions" — and it was overstating what is actually known
+            # about *this* model. A generic key short of MIN_COMPS borrows comps
+            # from its split-VRAM siblings, so a model owning zero comps of its
+            # own could report n=8. That is still the honest best estimate, but
+            # it is a different claim, and the caption is where the owner
+            # decides whether to trust the number. Shown only when the two
+            # differ, so the common case stays as short as it was.
+            #
+            # getattr because n_own is a recent addition to the pricing path; a
+            # Deal without it falls back to exactly the old line. A genuine 0 is
+            # meaningful here (it is the whole point), so only None means
+            # "unknown".
+            n_own = getattr(deal, "n_own", None)
+            if n_own is not None and int(n_own) != int(deal.n_comps):
+                margin += f"  <i>(n={deal.n_comps}, {int(n_own)} propios)</i>"
+            else:
+                margin += f"  <i>(n={deal.n_comps})</i>"
         lines.append(margin)
 
     # Comp-pool provenance (median_days_to_sale / n_sold / n_reserved) is
@@ -141,6 +201,9 @@ def build_caption(
     age = _age_str(getattr(item, "age_seconds", None))
     if age:
         detail_bits.append(f"Publicado {age}")
+    edited = _edited_str(item)
+    if edited:
+        detail_bits.append(edited)
     if detail_bits:
         lines.append(" · ".join(detail_bits))
 

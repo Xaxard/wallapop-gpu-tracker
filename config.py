@@ -126,9 +126,18 @@ MARGIN_RATE = _f("MARGIN_RATE", 0.18)
 # seed rather than from real reserved/sold comps. A seed is an educated guess
 # at what something is worth, and the whole feed is only as good as that guess:
 # if a seed is 25% too high, every ordinary listing looks like a bargain and the
-# alert stream becomes noise. Demanding more while confidence is low, and
-# relaxing automatically once MIN_COMPS real comps exist, is the honest way to
-# express that — rather than quietly tolerating a week of false positives.
+# alert stream becomes noise. Demanding more while confidence is low is the
+# honest way to express that, rather than quietly tolerating a week of false
+# positives.
+#
+# The penalty is released when observed evidence outweighs the prior it is being
+# shrunk toward — i.e. once the trimmed pool's total weight exceeds PRIOR_WEIGHT
+# — NOT simply once MIN_COMPS comps exist. The distinction matters and used to
+# be wrong: reaching MIN_COMPS only means a reference could be computed, and the
+# first such reference is still mostly the seed (at PRIOR_WEIGHT=5 against a
+# thin, time-decayed pool the seed is around 59% of the number). Dropping the
+# penalty there switched off the defence against a bad seed at precisely the
+# moment it was still guarding a mostly-seed price.
 SEED_MARGIN_MULTIPLIER = _f("SEED_MARGIN_MULTIPLIER", 1.6)
 
 # Default: shipped both ways — the worst case, and the gate we alert on.
@@ -173,6 +182,15 @@ BLOCKED_CONDITIONS = frozenset(
 # search response does not echo the condition back.
 ALLOWED_CONDITIONS = "un_opened,in_box,new,as_good_as_new,good,fair"
 
+# ---------------------------------------------------------------- sellers
+# Wallapop seller ids that may never trigger an alert. The same replica or
+# empty-box listing reappears under a fresh item_id every few days, which
+# defeats the (item_id, price) dedup entirely — the seller is the only stable
+# identifier across those relistings. Comma-separated, empty by default.
+BLOCKED_SELLERS = frozenset(
+    s.strip() for s in os.getenv("BLOCKED_SELLERS", "").split(",") if s.strip()
+)
+
 # --------------------------------------------------------------- search shape
 # `order_by=newest` on its own cripples the result set — the API returns a
 # heavily truncated page (measured: 13 items bare, as few as 1 once a geo and
@@ -200,7 +218,35 @@ ALERT_TIME_FILTER = os.getenv("ALERT_TIME_FILTER", "lastWeek")
 # A time_filter is what makes the query return results from that IP; it is the
 # only reason the alert loop kept working. 9% less depth is the correct trade
 # against 100% less data.
-COMPS_TIME_FILTER = os.getenv("COMPS_TIME_FILTER", "lastMonth") or None
+COMPS_TIME_FILTER = os.getenv("COMPS_TIME_FILTER", "lastWeek") or None
+
+# Sort order for comps searches. `most_relevance` is the intuitive choice for a
+# comps pool and it is the one that must never be used from CI.
+#
+# Measured 2026-08-17 against the live API, both loops on the same runner within
+# the same minute, both nationwide with no lat/lon:
+#
+#   alert  order_by=newest         time_filter=lastWeek   -> 80 items / search
+#   comps  order_by=most_relevance time_filter=lastMonth  ->  0 items / search
+#
+# Identical IP, identical endpoint, identical credentials. Every comps search
+# returned HTTP 200 with a well-formed but empty `organic_search_results`
+# section. From a Spanish IP the same comps request returns a full 40-item page,
+# so the query is valid — relevance ranking simply resolves to nothing when the
+# server cannot place the caller inside the marketplace, while recency ordering
+# does not need that context.
+#
+# The earlier `time_filter` work fixed page size and was necessary, but it was
+# never sufficient: it could not have fixed this, and the comps pool has been
+# empty for as long as run_log goes back. Every reference price the bot has been
+# quoting is therefore still its hand-written seed.
+#
+# lastWeek rather than lastMonth for the same reason — it is the exact pair
+# proven to work above, and one variable at a time. The trailing pool is not
+# narrowed by this: observations accumulate in the database run after run, so a
+# 30-day COMPS_WINDOW_DAYS still fills from a 7-day search window. Widen only
+# after confirming a run comes back non-empty.
+COMPS_ORDER_BY = os.getenv("COMPS_ORDER_BY", "newest")
 
 # --------------------------------------------------------------- comps math
 MIN_COMPS = _i("MIN_COMPS", 5)
@@ -251,6 +297,22 @@ DRY_RUN = os.getenv("DRY_RUN", "0") == "1"
 MIN_SANE_PRICE = _f("MIN_SANE_PRICE", 50.0)
 MAX_SANE_PRICE = _f("MAX_SANE_PRICE", 4000.0)
 
+# Floor on a price allowed into the reference-price pool.
+#
+# The reference price answers "what does this card actually sell for", so it is
+# built only from prices someone committed to — a reserved listing (a buyer
+# agreed) or an inferred sale (reserved, then gone). An *active* asking price
+# never enters it: sellers can ask whatever they like, and a pool of asks
+# measures optimism, not the market.
+#
+# The requirement that motivated this floor was "exclude anything under 5 EUR,
+# those are typos". This is deliberately set far above that: a GPU listed under
+# 50 EUR is not a typo, it is a dead card, a replica, a bare cooler or bait, and
+# letting a real 40 EUR listing into the pool drags the median down just as hard
+# as a 4 EUR typo would. 50 subsumes the 5 EUR guard rather than replacing it —
+# set MIN_COMP_PRICE=5 to get the literal behaviour.
+MIN_COMP_PRICE = _f("MIN_COMP_PRICE", 50.0)
+
 # How far below the asking price you could realistically negotiate a seller
 # down. A listing qualifies if a haggled offer at this discount would clear the
 # margin gate, even if the raw asking price alone would not — you can always
@@ -270,21 +332,48 @@ OFFER_DISCOUNT = _f("OFFER_DISCOUNT", 0.20)
 # — a genuine bargain at half the reference still passes.
 MIN_PLAUSIBLE_RATIO = _f("MIN_PLAUSIBLE_RATIO", 0.35)
 
-# Hard ceiling on what may ever trigger an alert, applied to the *asking*
-# price before any margin maths. This is a scope decision, not a maths one:
-# above it the capital at risk stops being worth it, and for GPUs it's also
-# what keeps whole PCs and gaming laptops out of the feed without needing to
-# identify them — a machine with a card in it is essentially never listed
-# under this. Comps are deliberately NOT capped: the reference price needs the
-# full distribution to be meaningful.
+# Ceiling on what may trigger an alert *without* a reference price behind it.
+#
+# This is the bootstrap path: no comps, no learned ceiling, nothing but a
+# keyword match, so the only available protection is a flat cap. It also keeps
+# whole PCs and gaming laptops out of that path without having to identify them
+# — a machine with a card in it is essentially never listed under this.
+#
+# Comps are deliberately NOT capped: the reference price needs the full
+# distribution to be meaningful.
 MAX_ALERT_PRICE = _f("MAX_ALERT_PRICE", 350.0)
 
+# Ceiling on what may trigger an alert *with* a reference price behind it.
+#
+# A flat 350 applied to every listing was throwing away the largest trades by
+# construction. A 4080 at 420 EUR against a 620 EUR reference has to clear a
+# 112 EUR required margin and a ~468 EUR buy ceiling — it is a better trade
+# than anything the cap allowed through, and it was never evaluated.
+#
+# Once a model has a reference price the margin gate is a real test, so the only
+# remaining job for a cap is bounding capital at risk on a single purchase.
+# That is what this is, and it is why it is much higher: it answers "how much am
+# I willing to put into one card", not "is this a good deal".
+MAX_CAPITAL_PRICE = _f("MAX_CAPITAL_PRICE", 700.0)
+
 # ------------------------------------------------------------------- ops
-# observations grows by ~one row per listing per run; at a 5-minute cadence
-# that is ~100k rows/day and will exhaust a free Supabase project. 90 days was
-# far too generous for that rate — and nothing reads an observation older than
-# COMPS_WINDOW_DAYS anyway, so everything past it is pure storage cost.
-OBSERVATION_RETENTION_DAYS = _i("OBSERVATION_RETENTION_DAYS", 21)
+# observations used to grow by one row per listing per run — ~100k rows/day at a
+# 5-minute cadence, which is what forced a 21-day horizon to stay inside the free
+# tier. Writing only *changed* observations cut that by orders of magnitude, so
+# the horizon no longer has to fight the comps window.
+#
+# And it was fighting it: 21 days of retention against a 60-day COMPS_WINDOW_DAYS
+# meant the purge deleted 39 days of the window the pricer believes it is reading.
+# The 14-day halflife built to make a 60-day window safe was doing nothing,
+# because the data it was meant to discount gently had already been deleted.
+#
+# Retention therefore tracks the comps window by default and is floored at it:
+# deleting a row the pricer still reads is never a legitimate saving, so a
+# too-small override is raised rather than honoured. Storing *more* than the
+# window is allowed (useful for backfills), it just buys nothing today.
+OBSERVATION_RETENTION_DAYS = max(
+    _i("OBSERVATION_RETENTION_DAYS", COMPS_WINDOW_DAYS), COMPS_WINDOW_DAYS
+)
 
 # junk_exclusions is a tuning aid, not a record: the phrase lists get adjusted
 # against what the filters are catching now, never against last month. It is

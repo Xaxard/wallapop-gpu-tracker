@@ -150,3 +150,195 @@ def test_generic_card_words_still_vouch_for_either_vendor():
     proof for both sides."""
     assert models.classify("Tarjeta grafica 4070 12GB").priceable
     assert models.classify("Tarjeta grafica 7600 8GB").priceable
+
+
+# ------------------------------------------- system RAM must not be read as VRAM
+@pytest.mark.parametrize(
+    "title,expected",
+    [
+        # The motivating shape: an 8GB card in a machine with 16GB of system
+        # RAM. Largest-wins classified this as the 16GB SKU and priced an 8GB
+        # card against a reference a whole tier higher — a false bargain
+        # manufactured out of a correctly-priced listing.
+        ("RTX 4060 Ti 8GB — PC con 16GB RAM", "rtx_4060_ti_8g"),
+        # Same, with the irrelevant figure written first, so the fix cannot be
+        # "prefer the earliest number" by accident.
+        ("PC con 16GB RAM y RTX 4060 Ti 8GB", "rtx_4060_ti_8g"),
+        # And the case largest-wins got right for the wrong reason: the card is
+        # the 16GB one and the RAM figure is bigger still. Under largest-wins the
+        # 32 matched no VRAM-gated entry at all, so this silently degraded to the
+        # generic key and lost the 16GB pool.
+        ("RTX 4060 Ti 16GB Gigabyte, PC 32GB RAM", "rtx_4060_ti_16g"),
+        ("Sapphire RX 9060 XT 8GB, saco de PC con 32 GB de RAM", "rx_9060_xt_8g"),
+    ],
+)
+def test_vram_nearest_the_model_number_wins_over_system_ram(title, expected):
+    assert models.classify(title).model_key == expected
+
+
+def test_extract_vram_still_answers_largest_wins_without_a_position():
+    """The bare signature is the description path and is unchanged: with no
+    model number to be near, there is no positional information to use."""
+    assert models.extract_vram("rtx 4060 ti 8 gb pc con 16 gb ram") == 16
+    assert models.extract_vram("sin memoria declarada") is None
+
+
+def test_extract_vram_near_a_span_picks_the_adjacent_figure():
+    norm = models.normalise("RTX 4060 Ti 8GB — PC con 16GB RAM")
+    span = (norm.index("4060"), norm.index("4060") + len("4060 ti"))
+    assert models.extract_vram(norm, near=span) == 8
+    assert models.extract_vram(norm) == 16  # same string, no position -> old answer
+
+
+def test_vram_proximity_does_not_disturb_the_pc_bundle_case():
+    """Regression guard on the existing bundle test: a whole-PC title still
+    classifies by its GPU and the RAM figure still isn't mistaken for VRAM."""
+    match = models.classify("PC Gaming Ryzen 5 + RTX 4070 + 32GB RAM")
+    assert match.model_key == "rtx_4070"
+
+
+# ------------------------------------------------- model named in the description
+def test_model_named_only_in_the_description_is_matched():
+    """A vague title used to return NO_MATCH, which made the listing unpriceable
+    and therefore silent — and a seller who can't name their card in the title is
+    exactly the seller worth buying from."""
+    match = models.classify(
+        "Tarjeta grafica Nvidia en perfecto estado",
+        "Es una RTX 4070 Ti de MSI, comprada en 2024, con caja",
+    )
+    assert match.model_key == "rtx_4070_ti"
+    assert match.priceable
+
+
+def test_a_description_match_is_capped_at_medium_confidence():
+    """Even with unambiguous branding in the description, a description match
+    must stay below a title match: 'medium' prices it but can never outrank."""
+    match = models.classify(
+        "Componente de ordenador, en buen estado",
+        "Nvidia GeForce RTX 4070 Super, tarjeta grafica de 12 GB",
+    )
+    assert match.model_key == "rtx_4070_super"
+    assert match.confidence == "medium"
+    assert match.priceable
+
+
+def test_a_title_match_always_beats_the_description():
+    """The description is consulted only when the title matched *nothing*. A
+    seller listing a 3060 who mentions a 4090 elsewhere sells a 3060."""
+    match = models.classify(
+        "RTX 3060 12GB Asus Dual",
+        "Tambien vendo una RTX 4090 y una RX 7900 XTX, pregunta",
+    )
+    assert match.model_key == "rtx_3060_12g"
+    assert match.confidence == "high"
+
+
+def test_description_naming_several_models_is_not_priceable():
+    """A description listing several cards is a bundle, a parts list or a
+    "compatible con" blurb, and there is no way to tell which card is for sale.
+    Ambiguity costs the match its priceability rather than resolving to the most
+    expensive candidate — the old first-registry-hit rule always picked the
+    highest tier named, so it was systematically biased toward inventing
+    bargains. Strong brand tokens must not buy back the confidence.
+    """
+    match = models.classify(
+        "Lote de componentes de PC",
+        "Incluye una RX 6600, una GTX 1650 y una Nvidia RTX 4070 Ti",
+    )
+    assert match.confidence == "low"
+    assert not match.priceable
+
+
+def test_the_adjacent_tier_false_positive_shape_is_unpriceable():
+    """The concrete shape this cap exists for, and the one MIN_PLAUSIBLE_RATIO
+    does not catch. A 3060 for sale whose description also mentions a 4090 used
+    to classify as a medium-confidence 4090 (registry order picks the top tier),
+    price a 300 EUR card against the 4090 reference, and alert as a huge margin.
+    Gross mismatches are caught by the plausibility floor; adjacent-tier ones —
+    a 300 EUR card against a 520 EUR 4070 Ti Super seed, offer 240 against a
+    ~392 ceiling — are not, and are the common case.
+    """
+    match = models.classify(
+        "Tarjeta grafica Nvidia, buen estado, envio incluido",
+        "La sacaba de mi PC. Nvidia RTX 3060 12GB. Tambien vendo una RTX 4090 aparte.",
+    )
+    assert match.confidence == "low"
+    assert not match.priceable
+
+
+def test_a_description_naming_one_card_several_ways_is_still_priceable():
+    """The cap counts distinct *cards*, not pattern hits. People name the same
+    card repeatedly and inconsistently inside one description, and several
+    registry entries match at one offset anyway — neither is ambiguity."""
+    match = models.classify(
+        "Componente de ordenador, recogida en Madrid",
+        "Vendo RTX 4070. La 4070 esta como nueva, rtx4070 con su caja original.",
+    )
+    assert match.model_key == "rtx_4070"
+    assert match.confidence == "medium"
+    assert match.priceable
+
+
+def test_split_vram_entries_at_one_offset_are_one_card_not_three():
+    """"4060 ti 16 gb" matches the 16GB, 8GB and generic registry entries at the
+    same offset. Counting hits instead of cards would make every split-VRAM
+    description ambiguous and unpriceable."""
+    match = models.classify(
+        "Grafica Nvidia en venta",
+        "Es una RTX 4060 Ti de 16 GB, modelo Gigabyte Eagle",
+    )
+    assert match.model_key == "rtx_4060_ti_16g"
+    assert match.confidence == "medium"
+    assert match.priceable
+
+
+def test_a_title_match_is_unaffected_by_extra_models_in_the_description():
+    """The cap applies only to the description-only branch. A title match stays
+    'high' no matter what the description lists — including the pre-existing
+    whole-PC bundle behaviour, which must not shift."""
+    match = models.classify(
+        "PC Gaming Ryzen 5 + RTX 4070 + 32GB RAM",
+        "Incluye tambien una RTX 3060 y una RX 6600 de repuesto",
+    )
+    assert match.model_key == "rtx_4070"
+    assert match.confidence == "high"
+    assert match.priceable
+
+
+def test_description_match_with_no_brand_evidence_anywhere_stays_low():
+    """The medium cap is a ceiling, not a floor — a bare number in a description
+    with no brand token in either field is still unpriceable."""
+    match = models.classify("Vendo pieza de ordenador", "es una 4070, poco uso")
+    assert match.model_key == "rtx_4070"
+    assert match.confidence == "low"
+    assert not match.priceable
+
+
+def test_description_match_reads_brand_evidence_from_the_title_too():
+    """The vague titles this branch exists for do usually name the vendor and
+    only omit the number, so brand proof may come from either field. It also
+    keeps the cross-vendor downgrade working across fields: nvidia branding must
+    not vouch for an AMD key even when the number is in the description."""
+    match = models.classify("Tarjeta grafica Nvidia GeForce", "modelo 7600, 8 gb")
+    assert match.model_key == "rx_7600"
+    assert match.confidence == "low"
+    assert not match.priceable
+
+
+def test_description_vram_disambiguates_a_description_only_match():
+    match = models.classify(
+        "Tarjeta grafica AMD, poco uso",
+        "Es una RX 9060 XT de 16 GB, Powercolor Reaper",
+    )
+    assert match.model_key == "rx_9060_xt_16g"
+    assert match.vram == 16
+
+
+@pytest.mark.parametrize("description", [None, "", "   ", "vendo por no usar, sin caja"])
+def test_a_description_naming_no_model_is_still_no_match(description):
+    """The new branch must not invent matches: no model in either field is still
+    NO_MATCH, unpriceable, and handled by the bootstrap-cap path as before."""
+    match = models.classify("Cosa de ordenador en venta", description)
+    assert match.model_key is None
+    assert match.confidence == "none"
+    assert not match.priceable

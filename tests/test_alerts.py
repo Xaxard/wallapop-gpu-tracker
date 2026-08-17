@@ -234,3 +234,98 @@ def test_can_ship_falls_back_to_shipping_flag_when_unset():
     item = make_item(shipping=True)  # user_allows_shipping left at its default (None)
     caption = build_caption(item, DEAL, "new", None, "RTX 4070")
     assert "envío disponible" in caption
+
+
+# ------------------------------------------------------- comp-pool provenance
+
+
+def test_own_and_total_comp_counts_are_both_shown_when_they_differ():
+    """n_comps was overstating what is known about *this* model.
+
+    A generic key short of MIN_COMPS borrows comps from its split-VRAM
+    siblings, so a model owning zero comps of its own could print n=12 as
+    provenance. That is still the honest best estimate, but it is a different
+    claim, and the caption is where the owner decides how much to trust it.
+    """
+    deal = replace(DEAL)
+    deal.n_own = 0
+    caption = build_caption(make_item(), deal, "new", None, "RTX 4070")
+    assert "n=12, 0 propios" in caption
+
+
+def test_only_the_total_is_shown_when_all_comps_are_the_model_s_own():
+    """The common case has to stay as short as it was."""
+    deal = replace(DEAL)
+    deal.n_own = 12
+    caption = build_caption(make_item(), deal, "new", None, "RTX 4070")
+    assert "n=12)" in caption
+    assert "propios" not in caption
+
+
+def test_unknown_n_own_falls_back_to_the_plain_count():
+    """n_own arrives on Deal from a concurrent change to the pricing path, so it
+    is read through getattr and None means "we don't know", not "zero" — a
+    genuine 0 is the interesting case and must stay distinguishable from an
+    absent field."""
+    deal = replace(DEAL)
+    deal.n_own = None
+    caption = build_caption(make_item(), deal, "new", None, "RTX 4070")
+    assert "n=12)" in caption
+    assert "propios" not in caption
+
+
+# ---------------------------------------------------------- modification recency
+
+
+def test_recent_edit_is_surfaced():
+    """`modified_at` was parsed off every listing and read by nothing.
+
+    It is the only signal for "the seller just cut the price" on a listing that
+    never alerted — `_decide_kind` can only compare against our own alert
+    history — and a recent edit also means a live seller, which is most of
+    whether an offer gets answered.
+    """
+    now = datetime.now(timezone.utc)
+    item = make_item(posted_at=now - timedelta(days=6), modified_at=now - timedelta(hours=3))
+    caption = build_caption(item, DEAL, "new", None, "RTX 4070")
+    assert "Editado hace 3 h" in caption
+
+
+def test_untouched_listing_shows_no_edit():
+    """Wallapop stamps modified_at on creation too, so a bare inequality would
+    print 'edited' on every listing in the feed and the signal would mean
+    nothing."""
+    now = datetime.now(timezone.utc)
+    item = make_item(posted_at=now - timedelta(hours=2), modified_at=now - timedelta(hours=2))
+    caption = build_caption(item, DEAL, "new", None, "RTX 4070")
+    assert "Editado" not in caption
+
+
+def test_missing_modified_at_shows_no_edit():
+    caption = build_caption(make_item(), DEAL, "new", None, "RTX 4070")
+    assert "Editado" not in caption
+
+
+def test_naive_modified_at_is_ignored_rather_than_raising():
+    item = make_item(modified_at=datetime(2026, 8, 1, 12, 0))  # no tzinfo
+    caption = build_caption(item, DEAL, "new", None, "RTX 4070")
+    assert "Editado" not in caption
+    assert len(caption) <= CAPTION_LIMIT
+
+
+def test_edit_line_does_not_break_the_truncation_order():
+    """The truncation logic assumes lines[-3] is the description, so anything
+    added to the detail line has to leave that shape intact."""
+    now = datetime.now(timezone.utc)
+    item = make_item(
+        description="x" * 5000,
+        posted_at=now - timedelta(days=6),
+        modified_at=now - timedelta(minutes=30),
+        condition="good",
+        brand="Gigabyte",
+    )
+    caption = build_caption(item, DEAL, "new", None, "RTX 4070")
+    assert len(caption) <= CAPTION_LIMIT
+    assert not has_unbalanced_tags(caption)
+    assert item.web_url in caption
+    assert "Editado hace 30 min" in caption

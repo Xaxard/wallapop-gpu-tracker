@@ -58,14 +58,61 @@ alter table listings add column if not exists whole_machine boolean default fals
 alter table listings add column if not exists posted_at timestamptz;
   -- the seller's real created_at, not when we first saw it
 alter table listings add column if not exists user_allows_shipping boolean;
-alter table listings add column if not exists family text;
-  -- 'gpu' | 'phone' — drives the per-family alert price cap
-alter table listings add column if not exists storage text;
-  -- phones: '128gb' | '256gb' | '512gb' | '1tb'
-  -- distinct from `shipping` (item_is_shippable), which is a category
-  -- capability rather than this seller's choice
+  -- this seller's choice on this listing, distinct from `shipping`
+  -- (item_is_shippable), which is only the category's general capability
+--
+-- `family` ('gpu' | 'phone') and `storage` ('128gb' | '256gb' | ...) used to be
+-- declared here for multi-family tracking. Phone tracking was reverted, GPUs are
+-- the only family, and nothing has ever written either column — models.py no
+-- longer even carries a family field to write. The ALTERs are removed so a fresh
+-- project never grows them.
+--
+-- They are NOT dropped automatically: this file is applied by hand and a
+-- `drop column` is the one statement in it that could destroy data if the
+-- assumption above is ever wrong. On a project that already has them, verify
+-- they are empty and then drop them yourself:
+--
+--   select count(*) from listings where family is not null or storage is not null;
+--   -- expect 0, then:
+--   alter table listings drop column if exists family, drop column if exists storage;
+--
+alter table listings add column if not exists country text;
+  -- 'ES' | 'PT' | 'IT' | ... Wallapop is one shared cross-border marketplace
+  -- and both loops search it nationwide, so the country is the only thing
+  -- distinguishing a card you can collect from one that has to ship from Milan.
+  -- parse_item has extracted it (and a test has asserted it) since the
+  -- nationwide switch, and alert_loop.listing_row has written it — but the
+  -- column was never created, so every fresh process sent one batch that failed
+  -- with PGRST204, logged the "apply the ALTER statements" warning, dropped the
+  -- field and carried on. The value was never once persisted.
+alter table listings add column if not exists seller_id text;
+  -- the seller behind the listing, and the cheapest noise filter available:
+  -- the same replica or empty-box listing reappears under a fresh item_id every
+  -- few days, which defeats the (item_id, price) alert dedup completely. The
+  -- seller is the only identifier that survives a relisting.
+  -- config.BLOCKED_SELLERS is applied against this.
+alter table listings add column if not exists modified_at timestamptz;
+  -- the seller's own last-edit timestamp. This is the "just cut the price"
+  -- signal; without it the alert loop can only infer a cut from its own
+  -- sent_alerts history, so a price cut on a listing it never alerted on is
+  -- invisible to it.
 
 create index if not exists listings_posted_at_idx on listings (posted_at desc);
+
+-- whole_machine feeds a `not whole_machine` predicate in the sold-comps query,
+-- and in Postgres `= false` excludes NULL. Every row written before the column
+-- existed — or during a window where db.Database._missing_columns had stripped
+-- it from the payload — carries NULL there and was permanently invisible to
+-- that query, silently shrinking the sold pool with no way to notice.
+--
+-- The query side is now NULL-tolerant, but a column whose meaning depends on
+-- every reader remembering that is a trap, so the invariant is made true at the
+-- storage layer as well. All three statements are safe to re-run: the update
+-- matches nothing once it has run, and set default / set not null are no-ops on
+-- a column that already has them.
+update listings set whole_machine = false where whole_machine is null;
+alter table listings alter column whole_machine set default false;
+alter table listings alter column whole_machine set not null;
 
 -- ------------------------------------------------------------ observations
 create table if not exists observations (
@@ -80,6 +127,17 @@ create table if not exists observations (
 create index if not exists observations_model_seen_idx
   on observations (model_key, status, seen_at desc);
 create index if not exists observations_item_idx on observations (item_id, seen_at desc);
+
+-- Retention needs a plain seen_at index and neither of the two above can serve
+-- one: a leading model_key or item_id column is useless to
+-- `order by seen_at limit 1` (db.Database._oldest) or to the bare seen_at range
+-- delete each purge slice issues. On the largest table in the database that is
+-- a sequential scan per slice, which is precisely the statement-timeout (57014)
+-- failure the slicing logic was written to avoid — and when the purge times out
+-- nothing is deleted, so the table only grows and the next run fails harder.
+-- junk_exclusions has had this index since it blew the quota; observations,
+-- which is bigger, did not.
+create index if not exists observations_seen_at_idx on observations (seen_at);
 
 -- ------------------------------------------------------------- model_prices
 create table if not exists model_prices (
@@ -103,6 +161,12 @@ alter table model_prices add column if not exists shrunk boolean default false;
 alter table model_prices add column if not exists median_days_to_sale numeric;
   -- how long this model actually takes to move: a 50 EUR margin in 6 days and
   -- one in 45 days are not the same trade
+alter table model_prices add column if not exists n_own int default 0;
+  -- of the n_comps behind this price, how many are the model's own rather than
+  -- borrowed from a sibling SKU via models.GENERIC_FALLBACKS. n_comps alone
+  -- cannot tell "12 real 4060 Ti 16GB comps" apart from "1 of its own plus 11
+  -- borrowed from the 8GB card", and those are very different claims about how
+  -- much the ceiling should be trusted.
 
 -- -------------------------------------------------------------- sent_alerts
 create table if not exists sent_alerts (
@@ -130,9 +194,16 @@ create table if not exists junk_exclusions (
 -- One row per listing, not one per listing per run. Without this the same
 -- exclusion was re-inserted every 5 minutes for as long as the listing stayed
 -- up (~288 rows/day each), which reached 2.86M rows in 16 days and exhausted
--- the free-tier quota. db.log_junk() also dedups client-side, so this index is
--- belt-and-braces rather than the only guard — but it is what makes the
--- invariant true regardless of which process is writing.
+-- the free-tier quota.
+--
+-- This index is now load-bearing rather than belt-and-braces: db.log_junk()
+-- upserts on item_id with resolution=ignore-duplicates and no longer reads the
+-- table back first. It used to, and it lost the race routinely — both loops run
+-- overlapping schedules over a shared discovery keyword space, so both see the
+-- same new junk listing within seconds, and whichever inserted second hit this
+-- index and crashed its whole run over a filter-tuning table. Enforcing the
+-- invariant in one place that all writers share is what makes that collision a
+-- no-op instead.
 create unique index if not exists junk_exclusions_item_uidx
   on junk_exclusions (item_id);
 create index if not exists junk_exclusions_seen_at_idx

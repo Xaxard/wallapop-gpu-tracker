@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 import math
+import random
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -56,6 +57,7 @@ class Item:
     location: str | None
     distance_km: float | None
     country: str | None = None
+    seller_id: str | None = None
     condition: str | None = None
     brand: str | None = None
     taxonomy: tuple[int, ...] = ()
@@ -235,6 +237,38 @@ def _user_allows_shipping(raw: dict) -> bool | None:
     return bool(val)
 
 
+def _seller_id(raw: dict) -> str | None:
+    """The account behind the listing.
+
+    Worth having for one reason: it is the only identifier that survives a
+    relisting. The same replica, empty box or "GPU" that is really a cooler
+    reappears under a fresh item_id every few days, so the (item_id, price)
+    alert dedup never sees it twice and the same seller's junk is alerted
+    indefinitely. config.BLOCKED_SELLERS is applied against this.
+
+    The two endpoints disagree about where it lives — /search nests it under the
+    `user` object while /items/{id} has carried a flat `user_id` — hence the
+    fallback chain, same as everything else in this file. A dict or list result
+    means this version nests it somewhere new; return None rather than persist
+    the repr of a container as if it were an id.
+    """
+    value = _first(
+        raw,
+        "user.id",
+        "user.user_id",
+        "user.hash",
+        "user.uuid",
+        "user_id",
+        "seller_id",
+        "seller.id",
+        "owner.id",
+        "owner_id",
+    )
+    if value is None or isinstance(value, (dict, list)):
+        return None
+    return str(value)
+
+
 def _taxonomy(raw: dict) -> tuple[int, ...]:
     """Category ids the listing is filed under.
 
@@ -273,6 +307,20 @@ def _epoch_ms(raw: dict, *paths: str) -> datetime | None:
     if dt.year < 2015 or dt > datetime.now(timezone.utc) + timedelta(days=1):
         return None
     return dt
+
+
+def _backoff_seconds(attempt: int) -> float:
+    """Seconds to wait before retrying attempt `attempt` (1-based).
+
+    Exponential, with +/-25% of jitter. The jitter is not cosmetic: this client
+    talks to a rate-limiting API from CI runners, several of which start on the
+    same cron minute. A deterministic 2/4/8s backoff means every runner that got
+    a 429 retries at exactly the same instant as the others, re-creating the
+    burst that caused the 429 in the first place; spreading them out is what
+    lets a retry actually land.
+    """
+    base = float(2 ** attempt)
+    return base * random.uniform(0.75, 1.25)
 
 
 def _haversine(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
@@ -332,6 +380,7 @@ def parse_item(raw: dict) -> Item | None:
         location=_first(raw, "location.city", "location.name", "user.location.city"),
         distance_km=_distance_km(raw),
         country=_first(raw, "location.country_code", "user.location.country_code"),
+        seller_id=_seller_id(raw),
         # condition/brand live under type_attributes on the detail endpoint;
         # /search doesn't return them, so this is None on search results.
         condition=_first(raw, "type_attributes.condition.value"),
@@ -374,16 +423,29 @@ class WallapopClient:
         returned like a 200 (not retried, not swallowed): it's a wrong-request
         story the same way 400 is, but callers here need to see it rather than
         have it collapse to None.
+
+        Nothing sleeps after the final attempt. Both branches used to back off
+        unconditionally, so a fully-exhausted request burned 2+4+8s and returned
+        None having spent its last 8 seconds waiting for a retry that was never
+        going to happen — 8s per dead request, on a loop that issues one per
+        search plus one per liveness check.
         """
         for attempt in range(1, config.HTTP_RETRIES + 1):
+            final = attempt == config.HTTP_RETRIES
             try:
                 resp = self._client.get(url, params=params)
                 if resp.status_code == 200 or resp.status_code == 404:
                     return resp
                 if resp.status_code in self._RETRYABLE_STATUS:
-                    wait = 2 ** attempt
+                    if final:
+                        log.warning(
+                            "HTTP %s from Wallapop on the last of %d attempts — giving up",
+                            resp.status_code, config.HTTP_RETRIES,
+                        )
+                        return None
+                    wait = _backoff_seconds(attempt)
                     log.warning(
-                        "HTTP %s from Wallapop (attempt %d/%d) — backing off %ds",
+                        "HTTP %s from Wallapop (attempt %d/%d) — backing off %.1fs",
                         resp.status_code, attempt, config.HTTP_RETRIES, wait,
                     )
                     time.sleep(wait)
@@ -392,7 +454,9 @@ class WallapopClient:
                 return None
             except (httpx.HTTPError, ValueError) as exc:
                 log.warning("Request failed (attempt %d/%d): %s", attempt, config.HTTP_RETRIES, exc)
-                time.sleep(2 ** attempt)
+                if final:
+                    break
+                time.sleep(_backoff_seconds(attempt))
         return None
 
     def _get(self, params: dict) -> dict | None:

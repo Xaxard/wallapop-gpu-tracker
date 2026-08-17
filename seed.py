@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 
 import config
-from db import Database, now
+from db import Database, chunked, now
 
 log = logging.getLogger("seed")
 
@@ -43,8 +43,8 @@ ALERT_SEARCHES = [
 # These matter more than the model-targeted searches above, because they are
 # the only way a *mispriced high-end* card is ever seen — nobody writes a
 # search for "RTX 4090" expecting one at 340 EUR, but that is exactly the
-# listing worth catching, and MAX_ALERT_PRICE lets it through on price while
-# the margin gate proves it is real.
+# listing worth catching, and the price caps let it through on price while the
+# margin gate proves it is real.
 #
 # Measured hit rates per 120 results (2026-08-02): "rtx" 37 classified,
 # "tarjeta grafica" 20, "grafica" 11, "rx" 5, "amd" 5. The weak ones are kept
@@ -69,8 +69,9 @@ DISCOVERY_SEARCHES = [
 # Every model in SEED_PRICES needs one, otherwise it can never learn a real
 # reference price and stays pinned to its seed forever. The high-end cards are
 # included even though nothing near their market value could ever clear
-# MAX_ALERT_PRICE: the whole point is that a 4090 listed at 340 EUR is the best
-# possible outcome, and recognising that requires knowing what a 4090 is worth.
+# MAX_CAPITAL_PRICE: the whole point is that a 4090 listed at 340 EUR is the
+# best possible outcome, and recognising that requires knowing what a 4090 is
+# worth.
 COMPS_MODELS = [
     ("rtx_3050", "rtx 3050"),
     ("rtx_3060", "rtx 3060"),
@@ -175,6 +176,24 @@ SEED_PRICES = {
 }
 
 
+# Server-side floor on every seeded search, alert and comps alike.
+#
+# No seeded search set one, so `min_sale_price` was never sent and every 40-item
+# page arrived with sub-50 EUR listings on it — which pricing.sane() then threw
+# away locally, after they had already cost their slot on the page. Given how
+# hard the search shape works to win page depth (the whole time_filter
+# investigation in config.py exists to get a page from 16 items to 40), that was
+# free depth left unclaimed for nothing.
+#
+# MIN_SANE_PRICE is the right number rather than MIN_COMP_PRICE, because this
+# bounds what the *API* returns, and nothing below the sanity band can be used
+# by either loop: an alert can't fire on it and it can't enter the comps pool.
+# A real GPU under 50 EUR is a dead card, a replica, a bare cooler or bait —
+# never a flip and never a comp — so filtering it at the server costs nothing
+# and buys back page slots for listings that can actually be acted on.
+MIN_SEARCH_PRICE = config.MIN_SANE_PRICE
+
+
 def build_search_rows() -> list[dict]:
     rows: list[dict] = []
 
@@ -190,6 +209,7 @@ def build_search_rows() -> list[dict]:
                 # learned reference price yet. Not an API-side restriction —
                 # searches run nationwide/international with no price cap.
                 "max_price": cap,
+                "min_price": MIN_SEARCH_PRICE,
                 "distance_km": None,
                 "active": True,
             }
@@ -204,6 +224,7 @@ def build_search_rows() -> list[dict]:
                 "model_key": None,
                 "category_ids": GPU,
                 "max_price": None,
+                "min_price": MIN_SEARCH_PRICE,
                 "distance_km": None,
                 "active": True,
             }
@@ -217,13 +238,53 @@ def build_search_rows() -> list[dict]:
                 "keywords": keywords,
                 "model_key": model_key,
                 "category_ids": GPU,
+                # Still uncapped upward — the reference price needs the full
+                # distribution — but floored, for the same page-depth reason as
+                # the alert searches. A sub-50 EUR listing is barred from the
+                # comps pool by MIN_COMP_PRICE anyway, so nothing that could
+                # move a median is being filtered out here.
                 "max_price": None,
+                "min_price": MIN_SEARCH_PRICE,
                 "distance_km": None,
                 "active": True,
             }
         )
 
     return rows
+
+
+def retire_orphaned_searches(db: Database, current_labels: set[str]) -> int:
+    """Deactivate any search this file no longer defines. Returns the count.
+
+    Searches upsert on `label`, which means this file can only ever *add* to the
+    table. Anything defined by an earlier version of it stays active forever:
+    the reverted phone searches are the obvious case, but so is every keyword
+    that was tried once and dropped. Each one costs a request on every pass, and
+    a stale comps row is worse than merely wasteful — `covered` in comps_loop is
+    built from comps search rows, and it is the set of models allowed to have
+    their listings judged absent and closed.
+
+    Deactivated rather than deleted: `active=false` keeps the row (and its id,
+    which nothing references but which is cheap to preserve) so a search can be
+    turned back on from the dashboard, and so this is safe to run without
+    thinking about what it might destroy.
+
+    The comparison is done client-side and the update is keyed on integer ids
+    rather than sending labels through a PostgREST `not.in.(...)` filter: labels
+    contain spaces and are free text, and quoting them into a filter expression
+    is a needless way to get this wrong.
+    """
+    res = db.c.table("searches").select("id,label,active").execute()
+    orphan_ids = [
+        row["id"]
+        for row in (res.data or [])
+        if row.get("active") and row["label"] not in current_labels
+    ]
+    if not orphan_ids:
+        return 0
+    for batch in chunked(orphan_ids, 100):
+        db.c.table("searches").update({"active": False}).in_("id", list(batch)).execute()
+    return len(orphan_ids)
 
 
 def main() -> None:
@@ -233,6 +294,9 @@ def main() -> None:
     rows = build_search_rows()
     db.c.table("searches").upsert(rows, on_conflict="label").execute()
     log.info("seeded %d searches", len(rows))
+    retired = retire_orphaned_searches(db, {r["label"] for r in rows})
+    if retired:
+        log.info("deactivated %d search(es) this file no longer defines", retired)
 
     existing = db.get_model_prices()
     written = 0

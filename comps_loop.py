@@ -8,44 +8,78 @@ reference price and buy-ceiling.
 from __future__ import annotations
 
 import logging
+import time
 import traceback
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 import config
 import junk
 import models
 import pricing
-from alert_loop import _check_dead_man
+from alert_loop import _check_dead_man, upsert_listing_batches
 from alerts import Telegram
 from db import Database, iso, now
 from wallapop_client import Item, WallapopClient
 
 log = logging.getLogger("comps")
 
+# Hard ceiling on liveness probes per run.
+#
+# `infer_sales` used to probe every open listing missing from a run, uncapped
+# and with no pause between requests — unlike the search path, which sleeps
+# REQUEST_DELAY between pages. Each probe can spend up to 14s inside the retry
+# backoff on a 403, so as `listings` grows this was the likeliest way to hit the
+# 70-minute workflow timeout, and the fastest way to earn a rate-limit that
+# looks exactly like the geolocation failure config.py documents at length.
+#
+# 50 probes at REQUEST_DELAY=1.0 is ~1 minute of the hourly budget in the good
+# case. Anything not probed this run simply falls back to the missing_runs
+# counter, which is the pre-existing behaviour and loses nothing beyond an hour
+# of latency on the closure.
+MAX_LIVENESS_PROBES = 50
 
-def _listing_row(item: Item, match: models.Match) -> dict:
-    return {
-        "item_id": item.item_id,
-        "title": item.title[:500],
-        "description": (item.description or "")[:2000],
-        "model_key": match.model_key,
-        "confidence": match.confidence if match.model_key else None,
-        "last_seen": iso(now()),
-        "last_price": item.price,
-        "last_status": item.status,
-        "web_url": item.web_url,
-        "image_url": item.image_url,
-        "shipping": item.shipping,
-        "location": str(item.location) if item.location else None,
-        "distance_km": item.distance_km,
-        "missing_runs": 0,
-        "condition": item.condition,
-        "brand": item.brand,
-        "taxonomy": list(item.taxonomy) or None,
-        "whole_machine": item.whole_machine,
-        "posted_at": iso(item.posted_at) if item.posted_at else None,
-        "user_allows_shipping": item.user_allows_shipping,
-    }
+
+class _SoldCompsCache:
+    """Run-scoped memo over `db.sold_comps`, transparent for everything else.
+
+    The comps loop asked for the same rows twice per model: once directly (for
+    median days-to-sale) and once inside `pricing.collect_comps`, which fetches
+    its own. At ~40 models that is ~80 round trips a run spent re-reading an
+    answer already in memory, and generic keys made it worse — a split-VRAM
+    sibling is queried once as its own target and again when the generic key
+    borrows from it.
+
+    Caching for the duration of the repricing loop is safe because every
+    closure this run will write has already been written: `infer_sales` runs to
+    completion before repricing starts, so nothing can change `sold_comps`'
+    answer underneath. It is deliberately *not* held across runs.
+
+    `pricing` may not be edited from here, so this is how one fetch reaches
+    both callers through its existing `sold_rows` parameter.
+
+    The key is the model alone, deliberately, and that is the whole mechanism:
+    every caller derives `since` as `now() - COMPS_WINDOW_DAYS` from its own
+    `now()`, so the two windows differ by the microseconds between the two
+    calls. Keying on the timestamp would therefore never hit. A row could in
+    principle sit inside that gap — meaning it closed almost exactly 60 days
+    ago, at a time-decay weight of ~0.05 — which is not a difference any
+    reference price can express. The first caller's window is the one used.
+    """
+
+    def __init__(self, db: Database) -> None:
+        self._db = db
+        self._cache: dict[str, list[dict]] = {}
+
+    def __getattr__(self, name: str) -> object:
+        # Only reached for names not found on this instance, so sold_comps
+        # below still wins and everything else goes straight to the real
+        # Database.
+        return getattr(self._db, name)
+
+    def sold_comps(self, model_key: str, since: datetime) -> list[dict]:
+        if model_key not in self._cache:
+            self._cache[model_key] = self._db.sold_comps(model_key, since)
+        return self._cache[model_key]
 
 
 def infer_sales(
@@ -70,9 +104,49 @@ def infer_sales(
 
     A failed request returns None and falls back to the counter — a network
     blip must never be read as a sale.
+
+    Probing is bounded on both axes, which it was not:
+
+      * only reserved listings are probed, via `db.open_reserved_listings`. That
+        query was written for exactly this ("the only ones worth spending a
+        detail request on") and had no callers — the optimisation was designed
+        and never wired up. A never-reserved listing cannot produce a sold comp
+        anyway: `mark_closed(item_id, None)` is all it can ever yield, so a
+        request confirming it is gone buys nothing but the hour of latency the
+        missing_runs counter already covers.
+      * at most MAX_LIVENESS_PROBES per run, with config.REQUEST_DELAY between
+        them, matching how polite the search path already is.
     """
     open_listings = db.get_open_listings_for_models(sorted(covered_models))
+
+    # The probe set is exactly the set where a probe can change an outcome: the
+    # listings the `was_reserved` test below can answer yes for, minus anything
+    # this run's searches already found (presence is proof of life, so a request
+    # would be pure waste).
+    #
+    # It is the union of two sources for the same reason `was_reserved` is:
+    # `open_reserved_listings` finds the sticky flag, including a listing that
+    # went reserved and has since un-reserved — the case the flag exists for and
+    # the one a status check cannot see. `last_status == 'reserved'` covers rows
+    # whose `ever_reserved` is still NULL, which is every listing the alert loop
+    # wrote before it started setting the column. Taking only the first source
+    # would have quietly dropped those from probing until the backlog aged out.
+    probe_ids: set[str] = set()
+    if wp is not None:
+        probe_ids = {
+            row["item_id"]
+            for row in db.open_reserved_listings(sorted(covered_models))
+            if row.get("item_id")
+        }
+        probe_ids.update(
+            row["item_id"]
+            for row in open_listings
+            if row.get("last_status") == "reserved" and row.get("item_id")
+        )
+        probe_ids -= seen_ids
+
     closed = 0
+    probes = 0
 
     for row in open_listings:
         item_id = row["item_id"]
@@ -82,7 +156,10 @@ def infer_sales(
             continue
 
         alive: bool | None = None
-        if wp is not None:
+        if wp is not None and item_id in probe_ids and probes < MAX_LIVENESS_PROBES:
+            if probes:
+                time.sleep(config.REQUEST_DELAY)
+            probes += 1
             try:
                 alive = wp.is_alive(item_id)
             except Exception:
@@ -114,6 +191,11 @@ def infer_sales(
             db.mark_closed(item_id, None)  # closed, uncertain — excluded from comps
         closed += 1
 
+    if probe_ids:
+        log.info(
+            "liveness: %d of %d reserved listings probed (cap %d)",
+            probes, len(probe_ids), MAX_LIVENESS_PROBES,
+        )
     return closed
 
 
@@ -142,13 +224,13 @@ def run_once() -> dict:
                     min_price=search.get("min_price"),
                     max_price=search.get("max_price"),  # null for comps
                     category_ids=search.get("category_ids"),
-                    order_by="most_relevance",
+                    # NOT most_relevance. See config.COMPS_ORDER_BY — relevance
+                    # ranking returns a well-formed *empty* result set when the
+                    # request geolocates outside the marketplace, which is every
+                    # request this loop has ever made from a GitHub runner.
+                    order_by=config.COMPS_ORDER_BY,
                     max_pages=config.COMPS_MAX_PAGES,
                     nationwide=True,
-                    # Normally None — see config. most_relevance already
-                    # returns full pages, so a time filter here would only
-                    # shrink the distribution, and depth is the whole point of
-                    # this loop.
                     time_filter=config.COMPS_TIME_FILTER,
                 )
                 count = 0
@@ -174,18 +256,6 @@ def run_once() -> dict:
         stats["items_seen"] = len(found)
         db.log_junk(junk_rows)
 
-        # ever_reserved is sticky, so reserved and non-reserved rows are written
-        # as separate batches: the non-reserved batch simply omits the column
-        # rather than resetting it to false.
-        reserved_rows, active_rows = [], []
-        for item, match in found.values():
-            row = _listing_row(item, match)
-            if item.reserved:
-                row["ever_reserved"] = True
-                reserved_rows.append(row)
-            else:
-                active_rows.append(row)
-
         # Ordering is forced from both sides: the change comparison needs the
         # state as it was before this pass, but observations have a foreign key
         # to listings, so a listing must exist before its observation can be
@@ -196,11 +266,12 @@ def run_once() -> dict:
         # matters: a prebuilt selling for 900 EUR is a real transaction, just
         # not one in the loose card its title names, and the reference price is
         # the number every buy ceiling is derived from.
+        #
+        # upsert_listing_batches owns the reserved/non-reserved split that keeps
+        # `ever_reserved` sticky, and lives in alert_loop.py so both loops share
+        # one row shape — see its docstring for the drift that motivated that.
         prior_states = db.listing_states(list(found))
-        if reserved_rows:
-            db.upsert_listings(reserved_rows)
-        if active_rows:
-            db.upsert_listings(active_rows)
+        upsert_listing_batches(db, found.values())
 
         stats["observations"] = db.insert_changed_observations(
             [
@@ -240,16 +311,19 @@ def run_once() -> dict:
             m.model_key for _, m in found.values() if m.priceable and m.model_key
         }
         since = now() - timedelta(days=config.COMPS_WINDOW_DAYS)
+        # One fetch of the sold rows, served to both callers. See
+        # _SoldCompsCache for why this is a wrapper rather than a plain local.
+        sold_cache = _SoldCompsCache(db)
         for model_key in sorted(targets):
             try:
                 # sold_rows carries closed_at plus posted_at/first_seen, which
                 # is what turns "50 EUR of margin" into "50 EUR of margin in
                 # 6 days" — the pricing module can't fetch it itself.
                 if pricing.recompute_model_price(
-                    db,
+                    sold_cache,
                     model_key,
                     existing.get(model_key),
-                    sold_rows=db.sold_durations(model_key, since),
+                    sold_rows=sold_cache.sold_comps(model_key, since),
                 ):
                     stats["models_updated"] += 1
             except Exception:
@@ -276,16 +350,17 @@ def run_once() -> dict:
             log.exception("could not deliver error ping")
         raise
     finally:
+        notes = f"closed={stats['closed']} repriced={stats['models_updated']}"
         db.finish_run(
             run_id,
             items_seen=stats["items_seen"],
             errors=stats["errors"],
-            notes=f"closed={stats['closed']} repriced={stats['models_updated']}",
+            notes=notes,
         )
         # Runs after finish_run so this run counts toward the streak. The comps
         # loop silently returning nothing for a day is the reason this exists.
         try:
-            _check_dead_man(db, telegram, "comps")
+            _check_dead_man(db, telegram, "comps", run_id=run_id, notes=notes)
         except Exception:
             log.warning("dead-man check failed", exc_info=True)
         telegram.close()

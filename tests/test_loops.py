@@ -5,6 +5,7 @@ fires, a reserved listing that gets alerted, a sale inferred one run too early.
 """
 
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -14,6 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import alert_loop  # noqa: E402
 import comps_loop  # noqa: E402
 import config  # noqa: E402
+import seed  # noqa: E402
 from wallapop_client import Item  # noqa: E402
 
 
@@ -25,6 +27,10 @@ def make_item(
     description="",
     condition=None,
     taxonomy=(),
+    seller_id=None,
+    brand=None,
+    posted_at=None,
+    modified_at=None,
 ):
     return Item(
         item_id=item_id,
@@ -39,7 +45,11 @@ def make_item(
         location="Madrid",
         distance_km=4.0,
         condition=condition,
+        brand=brand,
         taxonomy=taxonomy,
+        seller_id=seller_id,
+        posted_at=posted_at,
+        modified_at=modified_at,
     )
 
 
@@ -67,13 +77,17 @@ class FakeDB:
         self.missing_set = {}
         self.model_writes = []
         self.calls = []
+        self.finished = []
+        self.sold_comps_calls = []
 
     # --- alert loop surface
     def start_run(self, name):
         return 1
 
     def finish_run(self, run_id, **fields):
-        pass
+        # Recorded rather than ignored: the dead-man cooldown works by writing a
+        # marker into run_log.notes, so what lands here is the behaviour.
+        self.finished.append((run_id, fields))
 
     def get_searches(self, role):
         return [s for s in self._searches if s["role"] == role]
@@ -150,13 +164,11 @@ class FakeDB:
         return []
 
     def sold_comps(self, model_key, since):
+        self.sold_comps_calls.append((model_key, since))
         return []
 
     def upsert_model_price(self, row):
         self.model_writes.append(row)
-
-    def sold_durations(self, model_key, since):
-        return []
 
     def open_reserved_listings(self, keys):
         return [r for r in self._open if r.get("ever_reserved")]
@@ -173,11 +185,19 @@ class FakeDB:
 
 class FakeClient:
     """Stands in for WallapopClient in both roles: the search context manager
-    and the plain detail client the alert loop keeps open across candidates."""
+    and the plain detail client the alert loop keeps open across candidates.
 
-    def __init__(self, items):
+    `details` lets a test give the detail endpoint a *different* payload from
+    the search result, which is the only way to exercise fields the search
+    response never carries (condition and brand, and a taxonomy that only the
+    detail endpoint fills in).
+    """
+
+    def __init__(self, items, details=None):
         self._items = items
+        self._details = details or {}
         self.detail_calls = []
+        self.probed = []
 
     def __enter__(self):
         return self
@@ -194,12 +214,15 @@ class FakeClient:
 
     def fetch_detail(self, item_id):
         self.detail_calls.append(item_id)
+        if item_id in self._details:
+            return self._details[item_id]
         for item in self._items:
             if item.item_id == item_id:
                 return item
         return None
 
     def is_alive(self, item_id):
+        self.probed.append(item_id)
         return any(i.item_id == item_id for i in self._items)
 
 
@@ -245,11 +268,13 @@ PRICES = {
 def wire(monkeypatch):
     """Patch the loops' collaborators and hand back the fakes."""
 
-    def _wire(module, db, items):
+    def _wire(module, db, items, details=None):
         tg = FakeTelegram()
         monkeypatch.setattr(module, "Database", lambda *a, **k: db)
         monkeypatch.setattr(module, "Telegram", lambda *a, **k: tg)
-        monkeypatch.setattr(module, "WallapopClient", lambda *a, **k: FakeClient(items))
+        monkeypatch.setattr(
+            module, "WallapopClient", lambda *a, **k: FakeClient(items, details)
+        )
         monkeypatch.setattr(config, "require_secrets", lambda *a: None)
         return tg
 
@@ -365,9 +390,11 @@ def test_card_qualifies_via_offer_even_when_asking_is_above_the_ceiling(wire):
 
 
 def test_expensive_card_never_alerts_however_good_the_margin(wire):
-    """MAX_ALERT_PRICE is a hard scope cap on the asking price, applied before
-    any margin maths. A 4090 at 1100 with a 1050 ceiling would clear the offer
-    gate comfortably, and still must not fire."""
+    """A price cap on the asking price outranks the margin verdict. A 4090 at
+    1100 with a 1050 ceiling clears the offer gate comfortably and still must
+    not fire — capital at risk on one purchase is a separate question from
+    whether the trade is good, which is what MAX_CAPITAL_PRICE answers now that
+    a priced listing is no longer held to the 350 EUR bootstrap ceiling."""
     search = dict(ALERT_SEARCH, label="RTX 4090", keywords="rtx 4090",
                   model_key="rtx_4090", max_price=None)
     prices = {"rtx_4090": {"ref_price": 1200.0, "buy_ceiling": 1050.0,
@@ -394,6 +421,162 @@ def test_underpriced_high_end_card_still_gets_through_the_cap(wire):
 
     assert alert_loop.run_once()["alerts_sent"] == 1
     assert tg.sent[0][2] == 300.0
+
+
+def test_priced_listing_above_the_bootstrap_cap_is_still_evaluated(wire):
+    """The trade the flat 350 EUR cap was throwing away by construction.
+
+    A 4080 at 420 against a 620 reference has to clear a 112 EUR required margin
+    and a ~468 EUR shipped buy ceiling — a better trade than anything a 350 cap
+    could admit — and it was dropped in the pre-filter without `pricing.evaluate`
+    ever seeing it. Once a model has a reference price the margin gate is the
+    real test, so the cap that applies is MAX_CAPITAL_PRICE.
+    """
+    search = dict(ALERT_SEARCH, label="RTX 4080", keywords="rtx 4080",
+                  model_key="rtx_4080", max_price=None)
+    prices = {"rtx_4080": {"ref_price": 620.0, "buy_ceiling": 525.0,
+                           "buy_ceiling_in_person": 570.0, "n_comps": 9, "is_seed": False}}
+    db = FakeDB([search], prices)
+    tg = wire(alert_loop, db, [make_item("cap1", "RTX 4080 Gigabyte", 420.0)])
+
+    stats = alert_loop.run_once()
+    assert stats["alerts_sent"] == 1
+    assert stats["over_cap"] == 0
+    assert tg.sent[0][2] == 420.0
+
+
+def test_capital_cap_still_binds_on_a_priced_listing(wire):
+    """The raised cap is a raised cap, not the absence of one: past
+    MAX_CAPITAL_PRICE the answer is no regardless of the margin, because the
+    question there is how much goes into one card."""
+    search = dict(ALERT_SEARCH, label="RTX 5080", keywords="rtx 5080",
+                  model_key="rtx_5080", max_price=None)
+    prices = {"rtx_5080": {"ref_price": 900.0, "buy_ceiling": 780.0,
+                           "buy_ceiling_in_person": 830.0, "n_comps": 9, "is_seed": False}}
+    db = FakeDB([search], prices)
+    tg = wire(alert_loop, db, [make_item("cap2", "RTX 5080 Asus", 750.0)])
+
+    stats = alert_loop.run_once()
+    assert stats["alerts_sent"] == 0
+    assert stats["over_cap"] == 1
+    assert tg.sent == []
+
+
+def test_listing_with_no_reference_price_keeps_the_low_bootstrap_cap(wire):
+    """The bootstrap path is the one MAX_ALERT_PRICE still governs, and it must
+    not inherit the generous capital cap. With no learned price there is nothing
+    but a keyword match behind the alert, so the search's own 500 EUR bootstrap
+    cap is not sufficient protection — 400 EUR of capital on an unpriced guess
+    is exactly what the flat ceiling exists to refuse.
+    """
+    search = dict(ALERT_SEARCH, label="RTX 3070", keywords="rtx 3070",
+                  model_key="rtx_3070", max_price=500)
+    db = FakeDB([search], {})  # nothing learned, nothing seeded
+    tg = wire(alert_loop, db, [make_item("cap3", "RTX 3070 Asus Dual", 400.0)])
+
+    stats = alert_loop.run_once()
+    assert stats["alerts_sent"] == 0
+    assert stats["over_cap"] == 1
+    assert tg.sent == []
+
+
+def test_whole_machine_cannot_alert_through_the_raised_cap(wire):
+    """The second job the flat 350 EUR cap was quietly doing.
+
+    A prebuilt or a gaming laptop is essentially never listed under 350, so the
+    old cap kept whole machines out of the feed without identifying them.
+    MAX_CAPITAL_PRICE at 700 is squarely inside prebuilt territory, so form
+    factor now has to be rejected on purpose — off the `whole_machine` taxonomy
+    flag. This listing would otherwise sail through: 420 EUR against a 620
+    reference is a qualifying margin.
+    """
+    search = dict(ALERT_SEARCH, label="RTX 4080", keywords="rtx 4080",
+                  model_key="rtx_4080", max_price=None)
+    prices = {"rtx_4080": {"ref_price": 620.0, "buy_ceiling": 525.0,
+                           "buy_ceiling_in_person": 570.0, "n_comps": 9, "is_seed": False}}
+    db = FakeDB([search], prices)
+    tg = wire(
+        alert_loop,
+        db,
+        [make_item("pc2", "RTX 4080 sobremesa", 420.0, taxonomy=(24200, 24115))],
+    )
+
+    stats = alert_loop.run_once()
+    assert stats["alerts_sent"] == 0
+    assert stats["whole_machine"] == 1
+    assert tg.sent == []
+
+
+def test_whole_machine_revealed_only_by_the_detail_payload_is_blocked(wire):
+    """Some search results arrive without a taxonomy; the detail endpoint is the
+    authoritative one, so form factor is re-checked after enrichment rather than
+    trusted once."""
+    search = dict(ALERT_SEARCH, label="RTX 4080", keywords="rtx 4080",
+                  model_key="rtx_4080", max_price=None)
+    prices = {"rtx_4080": {"ref_price": 620.0, "buy_ceiling": 525.0,
+                           "buy_ceiling_in_person": 570.0, "n_comps": 9, "is_seed": False}}
+    db = FakeDB([search], prices)
+    tg = wire(
+        alert_loop,
+        db,
+        [make_item("pc3", "RTX 4080 Gigabyte OC", 420.0, taxonomy=())],
+        details={"pc3": make_item("pc3", "RTX 4080 Gigabyte OC", 420.0,
+                                  taxonomy=(24116,))},
+    )
+
+    stats = alert_loop.run_once()
+    assert stats["alerts_sent"] == 0
+    assert stats["whole_machine"] == 1
+    assert tg.sent == []
+
+
+# ------------------------------------------------------------ blocked sellers
+def test_blocked_seller_never_alerts(wire, monkeypatch):
+    """The alert dedup is keyed on (item_id, price), which a serial relister
+    defeats completely: the same replica card or empty box comes back under a
+    fresh item_id every few days and alerts as brand new every time. The seller
+    id is the only identifier that survives the relisting."""
+    monkeypatch.setattr(config, "BLOCKED_SELLERS", frozenset({"u666"}))
+    db = FakeDB([ALERT_SEARCH], PRICES)
+    tg = wire(
+        alert_loop,
+        db,
+        [
+            make_item("bs1", "RTX 3070 Gigabyte", 180.0, seller_id="u666"),
+            make_item("bs2", "RTX 3070 Asus", 180.0, seller_id="u1"),
+        ],
+    )
+
+    stats = alert_loop.run_once()
+    assert stats["blocked_seller"] == 1
+    assert [s[0] for s in tg.sent] == ["bs2"]
+
+
+def test_blocked_seller_listing_is_still_recorded(wire, monkeypatch):
+    """Blocking is about the alert feed, not about the data: the listing still
+    prices the market and still has to be visible for tuning the block list."""
+    monkeypatch.setattr(config, "BLOCKED_SELLERS", frozenset({"u666"}))
+    db = FakeDB([ALERT_SEARCH], PRICES)
+    wire(alert_loop, db, [make_item("bs3", "RTX 3070 Gigabyte", 180.0, seller_id="u666")])
+
+    alert_loop.run_once()
+    assert db.listings[0]["seller_id"] == "u666"
+    assert db.observations[0]["item_id"] == "bs3"
+
+
+def test_seller_id_is_persisted_by_both_loops(wire):
+    """A block list can only be maintained from ids the database actually holds,
+    so both loops have to write the column."""
+    adb = FakeDB([ALERT_SEARCH], PRICES)
+    wire(alert_loop, adb, [make_item("sid1", "RTX 3070 Gigabyte", 180.0, seller_id="u42")])
+    alert_loop.run_once()
+
+    cdb = FakeDB([dict(ALERT_SEARCH, role="comps", label="Comps RTX 3070")], PRICES)
+    wire(comps_loop, cdb, [make_item("sid1", "RTX 3070 Gigabyte", 180.0, seller_id="u42")])
+    comps_loop.run_once()
+
+    assert adb.listings[0]["seller_id"] == "u42"
+    assert cdb.listings[0]["seller_id"] == "u42"
 
 
 def test_implausibly_cheap_listing_is_treated_as_fraud_not_as_a_deal(wire):
@@ -448,6 +631,120 @@ def test_whole_machine_price_never_enters_a_comps_pool(wire):
 
     alert_loop.run_once()
     assert [o["model_key"] for o in db.observations] == [None]
+
+
+# ------------------------------------------------------- persistence contract
+def test_alert_loop_marks_ever_reserved(wire):
+    """The fastest sales were being lost by the loop best placed to catch them.
+
+    `ever_reserved` is sticky, and the alert loop's row builder omitted the
+    column entirely. `infer_sales` falls back to `last_status == 'reserved'` so
+    the common case survived, but a listing that goes reserved, un-reserves and
+    then vanishes closes with `sold_price = None` and yields no comp at all. The
+    5-minute loop is the one that sees short-lived listings, and a short-lived
+    listing is usually one that sold.
+    """
+    db = FakeDB([ALERT_SEARCH], PRICES)
+    wire(
+        alert_loop,
+        db,
+        [
+            make_item("er1", "RTX 3070 MSI", 150.0, reserved=True),
+            make_item("er2", "RTX 3070 Asus Dual", 150.0),
+        ],
+    )
+
+    alert_loop.run_once()
+    rows = {r["item_id"]: r for r in db.listings}
+    assert rows["er1"]["ever_reserved"] is True
+    # PostgREST only updates the columns present in the payload, so a
+    # non-reserved row must *omit* the column rather than send False — sending
+    # False would wipe the stickiest fact a listing has.
+    assert "ever_reserved" not in rows["er2"]
+
+
+def test_both_loops_write_the_same_listing_columns(wire):
+    """The two row builders drifted once — only the alert loop wrote `country` —
+    so a listing's column set depended on which loop happened to see it. They
+    are one function now; this pins that they stay one."""
+    adb = FakeDB([ALERT_SEARCH], PRICES)
+    wire(alert_loop, adb, [make_item("cols1", "RTX 3070 Gigabyte OC", 180.0)])
+    alert_loop.run_once()
+
+    cdb = FakeDB([dict(ALERT_SEARCH, role="comps", label="Comps RTX 3070")], PRICES)
+    wire(comps_loop, cdb, [make_item("cols1", "RTX 3070 Gigabyte OC", 180.0)])
+    comps_loop.run_once()
+
+    assert set(adb.listings[0]) == set(cdb.listings[0])
+    for column in ("country", "seller_id", "modified_at"):
+        assert column in adb.listings[0]
+
+
+def test_modified_at_is_persisted(wire):
+    """`Item.modified_at` was parsed and read by nothing. It is the only signal
+    for 'the seller just edited or cut the price' on a listing that never
+    alerted, so it has to reach the database to be usable at all."""
+    edited = datetime.now(timezone.utc) - timedelta(hours=2)
+    db = FakeDB([ALERT_SEARCH], PRICES)
+    wire(
+        alert_loop,
+        db,
+        [make_item("m1", "RTX 3070 Gigabyte OC", 180.0, modified_at=edited)],
+    )
+
+    alert_loop.run_once()
+    assert db.listings[0]["modified_at"] is not None
+    assert db.listings[0]["modified_at"].startswith(str(edited.year))
+
+
+def test_enriched_detail_fields_are_written_back(wire):
+    """Everything `_enrich` paid a request for used to be dropped on the floor.
+
+    The listings upsert happens before the alert pass, so the condition, brand,
+    seller-shipping flag and detail taxonomy were used for the caption and the
+    block check and then discarded — no condition value ever reached the
+    database, which is why the dashboard had none to show and 'which conditions
+    produced good buys' was unanswerable.
+    """
+    db = FakeDB([ALERT_SEARCH], PRICES)
+    wire(
+        alert_loop,
+        db,
+        [make_item("en1", "RTX 3070 Gigabyte OC", 180.0)],
+        details={
+            "en1": make_item(
+                "en1", "RTX 3070 Gigabyte OC", 180.0, condition="good", brand="Gigabyte"
+            )
+        },
+    )
+
+    alert_loop.run_once()
+    rows = [r for r in db.listings if r["item_id"] == "en1"]
+    assert len(rows) == 2, "the enriched row must be written back after the alert pass"
+    assert rows[0]["condition"] is None      # search response carries none
+    assert rows[-1]["condition"] == "good"   # detail response does
+    assert rows[-1]["brand"] == "Gigabyte"
+    # Candidates are non-reserved by construction, so the write-back must not
+    # mention the sticky column.
+    assert "ever_reserved" not in rows[-1]
+
+
+def test_enriched_write_back_is_one_batch(wire):
+    """A handful of rows per run, but one write, not one per listing."""
+    db = FakeDB([ALERT_SEARCH], PRICES)
+    wire(
+        alert_loop,
+        db,
+        [
+            make_item("eb1", "RTX 3070 Gigabyte OC", 180.0),
+            make_item("eb2", "RTX 3070 Asus Dual", 175.0),
+            make_item("eb3", "RTX 3070 MSI Ventus", 170.0),
+        ],
+    )
+
+    alert_loop.run_once()
+    # One batch for the search results, one for the three enriched rows.
+    assert db.calls.count("upsert_listings") == 2
 
 
 # ------------------------------------------------------------- sale inference
@@ -551,6 +848,135 @@ def test_never_reserved_item_closes_without_a_sold_price():
     )
     assert comps_loop.infer_sales(db, {"rtx_3070"}, seen_ids=set()) == 1
     assert db.closed["s3"] is None
+
+
+# --------------------------------------------------------- liveness probing
+def _open_row(item_id, ever_reserved, missing_runs=0, status="reserved"):
+    return {
+        "item_id": item_id,
+        "model_key": "rtx_3070",
+        "last_price": 200,
+        "last_status": status,
+        "ever_reserved": ever_reserved,
+        "missing_runs": missing_runs,
+        "title": "RTX 3070",
+    }
+
+
+def test_only_reserved_listings_are_probed(monkeypatch):
+    """The probe budget goes where a probe can change an outcome.
+
+    Every open listing missing from a run used to get a detail request, uncapped
+    and with no delay — each one able to spend up to 14s in retry backoff on a
+    403, which is both the likeliest way to hit the 70-minute workflow timeout
+    and the fastest way to earn a rate-limit. A never-reserved listing cannot
+    produce a sold comp in any case: `mark_closed(item_id, None)` is all it can
+    ever yield, so confirming it is gone buys nothing the missing_runs counter
+    doesn't already cover.
+    """
+    monkeypatch.setattr(config, "REQUEST_DELAY", 0)
+    db = FakeDB(
+        [],
+        open_listings=[_open_row("p1", True, 1), _open_row("p2", False, 1, "active")],
+    )
+    wp = FakeClient([])  # nothing alive
+
+    comps_loop.infer_sales(db, {"rtx_3070"}, seen_ids=set(), wp=wp)
+
+    assert wp.probed == ["p1"]
+    assert db.closed["p1"] == 200   # confirmed gone, and it was reserved
+    assert db.closed["p2"] is None  # counter path, closed but priceless
+
+
+def test_currently_reserved_listing_is_probed_even_without_the_sticky_flag(monkeypatch):
+    """The probe set has to match the `was_reserved` test, not just the flag.
+
+    `ever_reserved` is NULL on every listing the alert loop wrote before it
+    started setting the column, so `open_reserved_listings` alone would have
+    dropped those from probing until the backlog aged out — even though
+    `last_status == 'reserved'` makes them able to produce a sold comp today.
+    """
+    monkeypatch.setattr(config, "REQUEST_DELAY", 0)
+    row = _open_row("nf1", None, 1)  # reserved now, flag never written
+    db = FakeDB([], open_listings=[row])
+    wp = FakeClient([])
+
+    comps_loop.infer_sales(db, {"rtx_3070"}, seen_ids=set(), wp=wp)
+
+    assert wp.probed == ["nf1"]
+    assert db.closed["nf1"] == 200
+
+
+def test_liveness_probes_are_capped_per_run(monkeypatch):
+    """Past the cap, listings fall back to the missing_runs counter rather than
+    the run spending an unbounded number of requests."""
+    monkeypatch.setattr(config, "REQUEST_DELAY", 0)
+    monkeypatch.setattr(comps_loop, "MAX_LIVENESS_PROBES", 1)
+    db = FakeDB(
+        [],
+        open_listings=[_open_row(f"q{i}", True, 0) for i in range(3)],
+    )
+    wp = FakeClient([])
+
+    comps_loop.infer_sales(db, {"rtx_3070"}, seen_ids=set(), wp=wp)
+
+    assert len(wp.probed) == 1
+    # The two unprobed ones took the counter path: first miss, not yet closed.
+    assert db.missing_set == {"q1": 1, "q2": 1}
+    assert list(db.closed) == ["q0"]
+
+
+def test_liveness_probes_pause_between_requests(monkeypatch):
+    """The search path sleeps REQUEST_DELAY between pages; this path did not
+    sleep at all, which is what made it the impolite one."""
+    slept = []
+    monkeypatch.setattr(comps_loop.time, "sleep", slept.append)
+    monkeypatch.setattr(config, "REQUEST_DELAY", 0.25)
+    db = FakeDB([], open_listings=[_open_row("r1", True, 1), _open_row("r2", True, 1)])
+    wp = FakeClient([])
+
+    comps_loop.infer_sales(db, {"rtx_3070"}, seen_ids=set(), wp=wp)
+
+    assert len(wp.probed) == 2
+    assert slept == [0.25], "one pause, between the two probes"
+
+
+def test_a_listing_seen_this_run_is_never_probed(monkeypatch):
+    """Present in the results is already proof of life; a request would be pure
+    waste."""
+    monkeypatch.setattr(config, "REQUEST_DELAY", 0)
+    db = FakeDB([], open_listings=[_open_row("s9", True, 1)])
+    wp = FakeClient([])
+
+    comps_loop.infer_sales(db, {"rtx_3070"}, seen_ids={"s9"}, wp=wp)
+
+    assert wp.probed == []
+    assert db.missing_set["s9"] == 0
+
+
+# ------------------------------------------------------- redundant round trips
+def test_sold_comps_is_queried_once_per_model(wire):
+    """The same query ran twice per model — once directly for median
+    days-to-sale and once inside pricing.collect_comps — for ~80 redundant round
+    trips a run. Generic keys made it worse: a split-VRAM sibling was queried
+    once as its own target and again when the generic key borrowed from it.
+    """
+    search = {
+        "label": "Comps RTX 4060 TI",
+        "role": "comps",
+        "keywords": "rtx 4060 ti",
+        "model_key": "rtx_4060_ti",
+        "category_ids": config.CATEGORY_GPU,
+        "max_price": None,
+    }
+    db = FakeDB([search], {})
+    wire(comps_loop, db, [make_item("dd1", "RTX 4060 Ti 8GB", 260.0)])
+
+    comps_loop.run_once()
+
+    keys = [k for k, _ in db.sold_comps_calls]
+    assert keys, "the repricing pass must still read the sold rows"
+    assert len(keys) == len(set(keys)), f"sold_comps queried a model twice: {keys}"
 
 
 # ------------------------------------------------- storage-growth regressions
@@ -657,3 +1083,145 @@ def test_comps_loop_is_covered_by_the_dead_man_switch(wire):
     comps_loop.run_once()
     assert tg.errors, "comps must raise the alarm too"
     assert "comps" in tg.errors[0]
+
+
+def _marked_run(hours_ago):
+    """An empty run whose notes carry the dead-man marker."""
+    stamp = datetime.now(timezone.utc) - timedelta(hours=hours_ago)
+    return dict(
+        _empty_run(),
+        notes=f"junk_filtered=0 over_cap=0 {alert_loop.DEAD_MAN_MARKER}",
+        started_at=stamp.isoformat(),
+    )
+
+
+def test_dead_man_warning_is_marked_in_the_run_log(wire):
+    """The cooldown has to be stateless — every pass is a fresh Actions runner
+    with no memory of the last one — so the marker goes into run_log.notes,
+    which is state the check already reads."""
+    db = FakeDB([ALERT_SEARCH], PRICES, runs=[_empty_run()] * config.DEAD_MAN_RUNS)
+    tg = wire(alert_loop, db, [])
+
+    alert_loop.run_once()
+    assert tg.errors
+    written = [f.get("notes", "") for _, f in db.finished]
+    assert any(alert_loop.DEAD_MAN_MARKER in n for n in written)
+
+
+def test_dead_man_stays_quiet_when_a_recent_run_already_warned(wire):
+    """A weekend outage at the 5-minute cadence is ~1000 identical messages,
+    which is exactly how an alert channel stops being read — and an unread
+    channel is the same outage the switch exists to prevent."""
+    db = FakeDB(
+        [ALERT_SEARCH],
+        PRICES,
+        runs=[_empty_run(), _marked_run(1), _empty_run()],
+    )
+    tg = wire(alert_loop, db, [])
+
+    alert_loop.run_once()
+    assert tg.errors == [], "a warning already went out inside the cooldown"
+
+
+def test_dead_man_warns_again_once_the_cooldown_expires(wire):
+    """Suppression, not silence: a still-broken bot has to keep saying so, just
+    not every five minutes."""
+    stale = _marked_run(alert_loop.DEAD_MAN_COOLDOWN_HOURS + 2)
+    db = FakeDB([ALERT_SEARCH], PRICES, runs=[_empty_run(), stale, _empty_run()])
+    tg = wire(alert_loop, db, [])
+
+    alert_loop.run_once()
+    assert tg.errors, "past the cooldown the alarm must sound again"
+
+
+def test_dead_man_cooldown_does_not_mask_a_healthy_loop(wire):
+    """A marker from an old outage must not suppress anything once items flow —
+    the streak check still gates everything."""
+    healthy = dict(_empty_run(), items_seen=120)
+    db = FakeDB([ALERT_SEARCH], PRICES, runs=[healthy, _marked_run(1), healthy])
+    tg = wire(alert_loop, db, [make_item("dm1", "RTX 3070 Gigabyte OC", 180.0)])
+
+    alert_loop.run_once()
+    assert tg.errors == []
+
+
+# --------------------------------------------------------- persistent-host mode
+def test_single_pass_still_exits_non_zero_on_failure(monkeypatch):
+    """GitHub Actions decides whether the chain is healthy from the exit code,
+    so swallowing a failure in single-pass mode would turn a broken deploy into
+    a green build that alerts nobody."""
+    monkeypatch.setattr(sys, "argv", ["alert_loop.py"])
+    monkeypatch.setattr(alert_loop, "run_once", lambda: (_ for _ in ()).throw(RuntimeError("boom")))
+
+    with pytest.raises(RuntimeError):
+        alert_loop.main()
+
+
+def test_loop_mode_survives_a_failed_pass_and_backs_off(monkeypatch):
+    """Latency is most of the edge here, and --loop nearly halves time-to-alert
+    versus the ~5-minute Actions chain — but `while True` had no `try`, so one
+    transient Supabase blip stopped a persistent host permanently and silently.
+    """
+    monkeypatch.setattr(sys, "argv", ["alert_loop.py", "--loop"])
+    slept = []
+    monkeypatch.setattr(alert_loop.time, "sleep", slept.append)
+
+    calls = {"n": 0}
+    good = {"items_seen": 1, "alerts_sent": 0, "junk": 0, "over_cap": 0, "errors": 0}
+
+    def flaky():
+        calls["n"] += 1
+        if calls["n"] <= 2:
+            raise RuntimeError("supabase blip")
+        if calls["n"] == 3:
+            return good
+        raise KeyboardInterrupt  # the test's way out of `while True`
+
+    monkeypatch.setattr(alert_loop, "run_once", flaky)
+    with pytest.raises(KeyboardInterrupt):
+        alert_loop.main()
+
+    assert calls["n"] == 4, "a failed pass must not end the process"
+    # Two failures back off (45s then 90s), then a good pass resets to the
+    # normal cadence — no tight crash-loop hammering Wallapop and Telegram.
+    assert slept[0] == config.LOOP_INTERVAL_SECONDS
+    assert slept[1] == config.LOOP_INTERVAL_SECONDS * 2
+    assert slept[2] == config.LOOP_INTERVAL_SECONDS
+
+
+def test_loop_backoff_is_capped(monkeypatch):
+    """A hard outage — expired credentials, an API shape change — must not back
+    off toward infinity either; the ceiling keeps the host checking in."""
+    monkeypatch.setattr(sys, "argv", ["alert_loop.py", "--loop"])
+    slept = []
+    monkeypatch.setattr(alert_loop.time, "sleep", slept.append)
+
+    calls = {"n": 0}
+
+    def always_fails():
+        calls["n"] += 1
+        if calls["n"] > 20:
+            raise KeyboardInterrupt
+        raise RuntimeError("credentials expired")
+
+    monkeypatch.setattr(alert_loop, "run_once", always_fails)
+    with pytest.raises(KeyboardInterrupt):
+        alert_loop.main()
+
+    assert max(slept) == alert_loop.LOOP_BACKOFF_CAP_SECONDS
+
+
+# --------------------------------------------------------------- seeded searches
+def test_every_seeded_search_sends_a_price_floor():
+    """Free page depth that was being left unclaimed. No seeded search set
+    min_price, so `min_sale_price` never travelled and each 40-item page arrived
+    with sub-50 EUR listings that pricing.sane() then discarded locally — after
+    they had already spent their slot. The entire time_filter investigation in
+    config.py exists to get a page from 16 items to 40; giving slots away for
+    listings neither loop can use undoes part of that.
+    """
+    rows = seed.build_search_rows()
+    assert rows
+    assert {r["role"] for r in rows} == {"alert", "comps"}
+    for row in rows:
+        assert row["min_price"] == config.MIN_SANE_PRICE, row["label"]

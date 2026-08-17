@@ -1,14 +1,28 @@
 """GPU title -> canonical model_key parser.
 
+GPUs are the only product family this parser knows about, and deliberately so:
+phone/iPhone tracking was tried and reverted, and the owner does not want other
+families back. Anything that used to exist here to keep families apart has been
+removed rather than left dormant.
+
 Comps are only meaningful if a "4070" is never pooled with a "4070 Ti Super",
 so every listing is normalised to a canonical key before it can be priced.
 
 Rules:
   * most-specific pattern wins (ti super > ti > super > base), so the registry
     is ordered and the first match returns;
-  * VRAM disambiguates the split SKUs (4060 Ti / 5060 Ti 8GB vs 16GB); when the
-    title doesn't say, it falls back to a separate generic key rather than
-    guessing into one of the two pools;
+  * VRAM disambiguates the split SKUs (4060 Ti / 5060 Ti 8GB vs 16GB); the
+    figure used is the one written *nearest the model number*, not the largest
+    one in the string (see extract_vram); when the text doesn't say, it falls
+    back to a separate generic key rather than guessing into one of the two
+    pools;
+  * the title is tried first and wins outright. Only if the title matches
+    nothing at all is the description scanned, and such a match is capped at
+    'medium' confidence — a description is far noisier than a title, so it may
+    price a listing but must never outrank or override what the title says. A
+    description naming more than one distinct card is capped at 'low' instead:
+    a parts list or a bundle blurb gives no way to tell which card is for sale,
+    and guessing systematically invents bargains (see classify);
   * confidence is 'high' only when a brand token (rtx/geforce/radeon/rx/...)
     backs up the number. A bare "4070" in a noisy title returns 'low', and the
     caller must not price a low-confidence match.
@@ -64,11 +78,8 @@ class ModelDef:
     key: str
     display: str
     pattern: str
-    # When set, the match only counts if the title's VRAM equals this value.
+    # When set, the match only counts if the text's VRAM equals this value.
     vram: int | None = None
-    # Which product family this is. Drives the price cap, the brand-consistency
-    # check, and which junk rules are allowed to fire.
-    family: str = "gpu"
 
 
 def _num(n: str, *suffix: str) -> str:
@@ -185,7 +196,6 @@ class Match:
     display: str | None
     confidence: str  # 'high' | 'medium' | 'low' | 'none'
     vram: int | None = None
-    family: str | None = None
 
     @property
     def priceable(self) -> bool:
@@ -195,24 +205,58 @@ class Match:
 
 NO_MATCH = Match(None, None, "none")
 
-FAMILY_BY_KEY = {m.key: m.family for m in REGISTRY}
+# Confidence levels, weakest first. Used to *cap* a level rather than compare
+# strings ad hoc, so "at most medium" is expressed once.
+_CONFIDENCE_ORDER = ("none", "low", "medium", "high")
 
 
-def family_of(model_key: str | None) -> str | None:
-    """Family for a stored model_key, for callers that only kept the key."""
-    return FAMILY_BY_KEY.get(model_key or "")
+def _cap_confidence(level: str, ceiling: str) -> str:
+    """`level`, but never stronger than `ceiling`."""
+    if _CONFIDENCE_ORDER.index(level) <= _CONFIDENCE_ORDER.index(ceiling):
+        return level
+    return ceiling
 
 
-def extract_vram(norm_text: str) -> int | None:
-    """Largest plausible VRAM figure in the text.
+def _vram_hits(norm_text: str) -> list[tuple[int, int, int]]:
+    """Every plausible VRAM figure as (value, start, end) in `norm_text`."""
+    return [(int(m.group(1)), m.start(), m.end()) for m in VRAM_RE.finditer(norm_text)]
 
-    Largest wins because titles often carry both the card's VRAM and unrelated
-    numbers ("...para PC 16 gb RAM, grafica 8 gb") — but for the split SKUs we
-    only ever compare against 8/16, and the card's own VRAM is normally the one
-    quoted next to the model.
+
+def _gap(span: tuple[int, int], start: int, end: int) -> int:
+    """Character distance between two non-overlapping spans, 0 if they touch."""
+    if start >= span[1]:
+        return start - span[1]
+    if end <= span[0]:
+        return span[0] - end
+    return 0
+
+
+def extract_vram(norm_text: str, near: tuple[int, int] | None = None) -> int | None:
+    """The VRAM figure this text is asserting, or None.
+
+    With `near` — the span the model number matched at — the figure *closest to
+    the model number* wins. Titles routinely quote more than one memory size and
+    only one of them belongs to the card: "RTX 4060 Ti 8GB - PC con 16GB RAM" is
+    a real shape, and largest-wins read the system RAM as VRAM, classified it as
+    rtx_4060_ti_16g, and then priced an 8GB card against the 16GB reference —
+    manufacturing a bargain out of a correctly-priced card. Sellers write the
+    card's memory next to the card's name; that adjacency is the signal.
+
+    Without `near` there is no positional information to use (the caller is
+    scanning a description as a fallback, where the model number is absent), so
+    it degrades to the old largest-wins behaviour. That is the right default
+    there: the alternative is picking arbitrarily, and for the split SKUs we only
+    ever compare against 8/16.
+
+    Ties in distance are broken toward the larger figure, purely so the function
+    is deterministic; a genuine tie means the title is ambiguous either way.
     """
-    hits = [int(m.group(1)) for m in VRAM_RE.finditer(norm_text)]
-    return max(hits) if hits else None
+    hits = _vram_hits(norm_text)
+    if not hits:
+        return None
+    if near is None:
+        return max(value for value, _, _ in hits)
+    return min(hits, key=lambda h: (_gap(near, h[1], h[2]), -h[0]))[0]
 
 
 def _has_token(norm_text: str, tokens: tuple[str, ...]) -> bool:
@@ -247,30 +291,150 @@ def _confidence(norm_text: str, has_vram_proof: bool, key: str) -> str:
     return "low"
 
 
+def _scan(
+    norm_text: str,
+    *,
+    vram_fallback: str = "",
+    brand_text: str | None = None,
+    ceiling: str | None = None,
+) -> Match | None:
+    """Run the registry against one normalised string. None if nothing matched.
+
+    Registry order does the disambiguation: every VRAM-gated entry sits above
+    its generic fallback, which in turn sits above the shorter base-model
+    pattern, so the first match is always the most specific one.
+
+    `vram_fallback` is a second string to read VRAM from when `norm_text` quotes
+    none; `brand_text` is what the confidence check reads (brand evidence is
+    allowed to come from a different field than the model number); `ceiling`
+    caps the confidence the scan may return.
+    """
+    brand_text = norm_text if brand_text is None else brand_text
+    # One VRAM read per distinct match position, not per registry entry: a
+    # "4060 ti" title is tried against the 16GB, 8GB and generic entries in turn
+    # and they all match at the same offset.
+    per_span: dict[tuple[int, int], int | None] = {}
+
+    for model, rx in _COMPILED:
+        hit = rx.search(norm_text)
+        if hit is None:
+            continue
+        span = hit.span()
+        if span not in per_span:
+            vram = extract_vram(norm_text, near=span)
+            if vram is None and vram_fallback:
+                vram = extract_vram(vram_fallback)
+            per_span[span] = vram
+        vram = per_span[span]
+        if model.vram is not None and vram != model.vram:
+            continue
+        confidence = _confidence(brand_text, model.vram is not None, model.key)
+        if ceiling is not None:
+            confidence = _cap_confidence(confidence, ceiling)
+        return Match(model.key, model.display, confidence, vram)
+
+    return None
+
+
+def _distinct_keys(norm_text: str) -> set[str]:
+    """Every distinct model key `norm_text` resolves to — one per card named.
+
+    Counts *cards*, not pattern hits. Two things would otherwise inflate the
+    count and they are both the same card written once or twice:
+
+      * several registry entries match at the same offset ("4060 ti 16 gb" hits
+        the 16GB entry, the 8GB entry and the generic entry), and
+      * the same card named repeatedly and inconsistently, which is how people
+        actually write descriptions ("RTX 4070 ... la 4070 ... rtx4070").
+
+    So occurrences are grouped by the offset the model number starts at — every
+    registry pattern begins with a distinct 4-digit number, so one offset is
+    always exactly one card — and each group is resolved to its winning entry the
+    same way _scan resolves one: first entry in registry order that matches there
+    and satisfies its VRAM gate. The result is the set of cards the text names.
+    """
+    starts = {hit.start() for _, rx in _COMPILED for hit in rx.finditer(norm_text)}
+    keys: set[str] = set()
+    for start in sorted(starts):
+        for model, rx in _COMPILED:
+            hit = rx.match(norm_text, start)
+            if hit is None:
+                continue
+            if model.vram is not None and extract_vram(norm_text, near=hit.span()) != model.vram:
+                continue
+            keys.add(model.key)
+            break
+    return keys
+
+
 def classify(title: str | None, description: str | None = None) -> Match:
-    """Map a listing title (with the description as a weak tiebreak) to a model."""
+    """Map a listing to a model — title first, description only as a last resort.
+
+    A title match always wins and is never overridden: titles are what sellers
+    put effort into and they name the thing being sold, while descriptions list
+    the whole machine it came out of, the buyer's options, and what else the
+    seller has for sale.
+
+    The description pass exists because "Tarjeta gráfica Nvidia, pregunta por el
+    modelo" style titles returned NO_MATCH, which made the listing unpriceable
+    and therefore silent — and a vague title correlates with a seller who does
+    not know what they have, which is exactly the population worth buying from.
+    An *unambiguous* description — one that names a single card, however many
+    times and however inconsistently — is capped at 'medium': still priceable,
+    but structurally unable to outrank a title.
+
+    A description naming *more than one* card is capped at 'low', which
+    Match.priceable refuses, so it can never reach the margin engine. This branch
+    exists to recover listings whose seller did not put the model in the title,
+    and the value in those is precisely that the seller does not know what they
+    have. A description listing several different cards is a different animal —
+    a bundle, a parts list, a spec sheet, a "compatible con" blurb — and there is
+    no reliable way to tell which one is for sale. Ambiguity should cost the match
+    its priceability rather than resolve to the most expensive candidate, which is
+    what the earlier first-registry-hit rule did: because the registry is ordered
+    newest-first, the highest-tier card named always won, so the rule was
+    systematically biased toward inventing bargains.
+
+    That bias was not covered by any downstream guard. MIN_PLAUSIBLE_RATIO only
+    catches gross mismatches — a 150 EUR card against a 1200 EUR 4090 reference
+    is below 0.35*ref and is rejected — but adjacent-tier confusion, the common
+    case, sails through: a 300 EUR card whose description also names a 4070 Ti
+    Super (seed 520) sits well above 0.35*520 = 182, its 240 EUR offer clears the
+    ~392 ceiling, and it alerts as a strong deal.
+
+    The key from the winning registry entry is still returned on an ambiguous
+    description, so logs and same_family() see what was recognised; it is the
+    confidence, and therefore the pricing, that is withheld. A title match is
+    unaffected in every case, and so is a single-model description.
+    """
     norm_title = normalise(title)
     if not norm_title:
         return NO_MATCH
+    norm_desc = normalise(description)
 
     # VRAM is read from the title first; the description is a fallback because
     # it's far noisier (system RAM, other parts in a bundle, ...).
-    vram = extract_vram(norm_title)
-    if vram is None and description:
-        vram = extract_vram(normalise(description))
+    match = _scan(norm_title, vram_fallback=norm_desc)
+    if match is not None:
+        return match
 
-    # Registry order does the disambiguation: every VRAM-gated entry sits above
-    # its generic fallback, which in turn sits above the shorter base-model
-    # pattern, so the first match is always the most specific one.
-    for model, rx in _COMPILED:
-        if not rx.search(norm_title):
-            continue
-        if model.vram is not None:
-            if vram != model.vram:
-                continue
-            confidence = _confidence(norm_title, True, model.key)
-        else:
-            confidence = _confidence(norm_title, False, model.key)
-        return Match(model.key, model.display, confidence, vram, family=model.family)
+    if norm_desc:
+        # Brand tokens are read from title + description together: the vague
+        # titles this branch exists for usually do say "tarjeta gráfica" or
+        # "Nvidia" and only omit the number, and that is real vendor evidence.
+        # It also keeps the rival-vendor downgrade working across the two
+        # fields, so an nvidia title with a "7600" in the description still
+        # drops below priceable instead of pricing as a Radeon.
+        # One card named in the description may price the listing; several may
+        # not. See the docstring for why ambiguity is resolved by withholding
+        # priceability rather than by picking a candidate.
+        unambiguous = len(_distinct_keys(norm_desc)) <= 1
+        match = _scan(
+            norm_desc,
+            brand_text=f"{norm_title} {norm_desc}",
+            ceiling="medium" if unambiguous else "low",
+        )
+        if match is not None:
+            return match
 
     return NO_MATCH

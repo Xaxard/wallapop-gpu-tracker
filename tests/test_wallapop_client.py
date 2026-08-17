@@ -4,6 +4,7 @@ import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import httpx
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -106,6 +107,7 @@ def test_parse_item_new_fields_default_absent_on_search_shape():
     assert item.modified_at is None
     assert item.user_allows_shipping is None
     assert item.age_seconds is None
+    assert item.seller_id is None
 
 
 # --------------------------------------------------------- taxonomy / whole_machine
@@ -221,6 +223,56 @@ def test_can_ship_falls_back_to_shipping_when_user_flag_missing():
     assert item.can_ship is True
 
 
+# --------------------------------------------------------------- seller_id
+# The one identifier that survives a relisting: the same replica or empty-box
+# listing comes back under a fresh item_id every few days, so the
+# (item_id, price) alert dedup never sees it twice.
+def test_parse_item_seller_id_from_search_shape_user_object():
+    item = wc.parse_item(
+        {
+            "id": "s1",
+            "title": "RTX 4070",
+            "user": {"id": "user-abc-123", "micro_name": "Ana", "online": True},
+        }
+    )
+    assert item.seller_id == "user-abc-123"
+
+
+def test_parse_item_seller_id_from_detail_shape_flat_user_id():
+    item = wc.parse_item(
+        {
+            "id": "s2",
+            "title": {"original": "RTX 4070"},
+            "user_id": "flat-hash-987",
+        }
+    )
+    assert item.seller_id == "flat-hash-987"
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        {"id": "s3", "title": "t"},                       # nothing at all
+        {"id": "s3", "title": "t", "user": {}},           # user object, no id
+        {"id": "s3", "title": "t", "user": {"id": ""}},   # empty string is not an id
+    ],
+)
+def test_parse_item_seller_id_absent(raw):
+    assert wc.parse_item(raw).seller_id is None
+
+
+def test_parse_item_seller_id_ignores_a_nested_container():
+    """A dict here means the API moved the id somewhere new. Storing the repr of
+    a container as if it were a seller id would poison BLOCKED_SELLERS."""
+    item = wc.parse_item({"id": "s4", "title": "t", "user": {"id": {"hash": "x"}}})
+    assert item.seller_id is None
+
+
+def test_parse_item_seller_id_is_coerced_to_str():
+    item = wc.parse_item({"id": "s5", "title": "t", "user": {"id": 88123}})
+    assert item.seller_id == "88123"
+
+
 # ----------------------------------------------------------- detail-shape parsing
 def test_parse_item_detail_shape_title_description_price():
     item = wc.parse_item(
@@ -304,6 +356,64 @@ def test_exhausting_all_retries_returns_none(monkeypatch):
 
     assert client._get({"keywords": "rtx 4070"}) is None
     assert fake.calls == 3
+
+
+# ------------------------------------------------------------------- backoff
+class _SleepSpy:
+    """Records every backoff instead of actually waiting."""
+
+    def __init__(self) -> None:
+        self.waits: list[float] = []
+
+    def __call__(self, seconds):
+        self.waits.append(seconds)
+
+
+class _RaisingHttpxClient:
+    """Every request fails at the transport layer."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def get(self, url, params=None):
+        self.calls += 1
+        raise httpx.ConnectError("connection refused")
+
+
+def test_no_sleep_after_the_final_retryable_status(monkeypatch):
+    """Sleeping after the last attempt waits for a retry that never comes — at
+    HTTP_RETRIES=3 that was 8 wasted seconds on every fully-failed request."""
+    spy = _SleepSpy()
+    monkeypatch.setattr("time.sleep", spy)
+    monkeypatch.setattr(config, "HTTP_RETRIES", 3)
+    fake = FakeHttpxClient([FakeResponse(503)])
+    client = wc.WallapopClient(client=fake)
+
+    assert client._get({"keywords": "rtx 4070"}) is None
+    assert fake.calls == 3
+    assert len(spy.waits) == 2, "one backoff between attempts, none after the last"
+
+
+def test_no_sleep_after_the_final_transport_error(monkeypatch):
+    spy = _SleepSpy()
+    monkeypatch.setattr("time.sleep", spy)
+    monkeypatch.setattr(config, "HTTP_RETRIES", 3)
+    fake = _RaisingHttpxClient()
+    client = wc.WallapopClient(client=fake)
+
+    assert client._get({"keywords": "rtx 4070"}) is None
+    assert fake.calls == 3
+    assert len(spy.waits) == 2
+
+
+def test_backoff_grows_exponentially_and_is_jittered():
+    """Jitter matters because several CI runners start on the same cron minute:
+    an undithered 2/4/8s retry has all of them hit the rate limiter again at the
+    same instant, reproducing the burst that caused the 429."""
+    first = [wc._backoff_seconds(1) for _ in range(200)]
+    assert all(1.5 <= w <= 2.5 for w in first)      # 2s +/- 25%
+    assert len(set(first)) > 1, "a constant backoff is not jittered"
+    assert min(wc._backoff_seconds(3) for _ in range(50)) > max(first)
 
 
 # ------------------------------------------------------------------ is_alive

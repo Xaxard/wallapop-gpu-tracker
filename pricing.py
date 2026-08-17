@@ -4,6 +4,22 @@ The reference price is deliberately *not* the mean of active asking prices —
 those are aspirational. It's the trimmed median of what the market actually
 transacted at: reserved listings (someone agreed to buy) plus listings inferred
 sold (reserved, then vanished).
+
+INVARIANT — what may enter the reference-price pool:
+  * an observation with status == 'reserved' (a buyer committed at that price);
+  * a listing inferred sold, contributing its sold_price;
+  * nothing else. An *active* asking price may never become a comp, at any
+    price, under any confidence, via any code path. Sellers can ask whatever
+    they like; a pool of asks measures optimism, not the market, and the
+    reference price is what every buy ceiling in the bot is derived from.
+  * and every admitted price must clear comp_sane() — config.MIN_COMP_PRICE at
+    the bottom, not MIN_SANE_PRICE, because the pool floor and the
+    "is this listing worth alerting on" floor are separate questions.
+
+collect_comps() is the only place a price enters the pool, so that is where the
+invariant is enforced: the two loops it reads from (db.reserved_comps,
+db.sold_comps) are status-filtered at the query, and comp_sane() is applied to
+both branches. Anything added here later must go through the same two doors.
 """
 
 from __future__ import annotations
@@ -120,6 +136,24 @@ def sane(price: float | None) -> bool:
     return price is not None and config.MIN_SANE_PRICE <= price <= config.MAX_SANE_PRICE
 
 
+def comp_sane(price: float | None) -> bool:
+    """May this price be admitted to the reference-price pool?
+
+    Separate from sane() on purpose, even though the two floors happen to be
+    equal at the defaults. They answer different questions and move for
+    different reasons: sane() gates *alerting* on a listing, while this gates
+    what the market's resale price is *learned from*. Tightening the pool floor
+    to buy a cleaner median should not silently stop the alert path evaluating
+    cheap listings, and vice versa — so the pool reads MIN_COMP_PRICE and the
+    alert path keeps MIN_SANE_PRICE. See config.MIN_COMP_PRICE for why the
+    owner's literal "exclude anything under 5 EUR" is implemented as 50.
+
+    The upper bound stays MAX_SANE_PRICE: above it a price is a bundle or a typo
+    regardless of which question is being asked.
+    """
+    return price is not None and config.MIN_COMP_PRICE <= price <= config.MAX_SANE_PRICE
+
+
 # ----------------------------------------------------------- time helpers
 def _parse_dt(value: object) -> datetime | None:
     """Best-effort ISO-timestamp parse; Supabase returns 'Z'-suffixed strings."""
@@ -173,24 +207,33 @@ def collect_comps(db: Database, model_key: str) -> list[Comp]:
     through, so a confirmed sale is the stronger evidence — and both are
     further discounted by age via _time_decay, so a stale comp barely moves
     the reference at all.
+
+    This function is the sole gate on the module invariant documented at the top
+    of the file: only committed prices, never asking prices, and never a price
+    below config.MIN_COMP_PRICE. Both branches below are committed-price
+    branches — reserved observations and inferred sales — and both are filtered
+    through comp_sane(). There is no third branch and there must not be one.
     """
     since = now() - timedelta(days=config.COMPS_WINDOW_DAYS)
     per_item: dict[str, Comp] = {}
 
-    # Reserved observations, newest first, so the first hit per item wins.
+    # Reserved observations, newest first, so the first hit per item wins. The
+    # status == 'reserved' filter lives in db.reserved_comps, which is what keeps
+    # active asking prices out — an 'active' row is never returned here.
     for row in db.reserved_comps(model_key, since):
         item_id = row["item_id"]
         price = row.get("price")
-        if item_id in per_item or not sane(price):
+        if item_id in per_item or not comp_sane(price):
             continue
         age = _age_days(_parse_dt(row.get("seen_at")))
         per_item[item_id] = Comp(float(price), config.RESERVED_WEIGHT * _time_decay(age), "reserved")
 
-    # An inferred sale is the stronger signal, so it overwrites.
+    # An inferred sale is the stronger signal, so it overwrites. sold_price is
+    # the price the listing carried while reserved, i.e. also a committed price.
     for row in db.sold_comps(model_key, since):
         item_id = row["item_id"]
         price = row.get("sold_price")
-        if not sane(price):
+        if not comp_sane(price):
             continue
         age = _age_days(_parse_dt(row.get("closed_at")))
         per_item[item_id] = Comp(float(price), config.SOLD_WEIGHT * _time_decay(age), "sold")
@@ -273,15 +316,16 @@ def recompute_model_price(
     time_to_sale_days for why this module can't fetch them itself). Omit it
     and the previous value is carried forward untouched.
     """
-    comps = collect_comps(db, model_key)
+    own = collect_comps(db, model_key)
+    comps = own
     if len(comps) < config.MIN_COMPS:
         extra = borrowed_comps(db, model_key)
         if extra:
             log.info(
                 "%s: %d own comps, borrowing %d from sibling SKUs",
-                model_key, len(comps), len(extra),
+                model_key, len(own), len(extra),
             )
-            comps = comps + extra
+            comps = own + extra
 
     if len(comps) < config.MIN_COMPS:
         log.info(
@@ -312,6 +356,36 @@ def recompute_model_price(
         ref = raw_ref
         shrunk = False
 
+    # is_seed has to describe the *number written*, not "has this model ever been
+    # recomputed". It used to be hardcoded False on the first successful run,
+    # which released the SEED_MARGIN_MULTIPLIER penalty while the value was still
+    # mostly the seed: on a first recompute the prior *is* the seed, and with
+    # PRIOR_WEIGHT=5 against the n_eff a fresh model actually reaches (a thin
+    # pool of reserved comps at RESERVED_WEIGHT=0.7, time-decayed, typically
+    # summing to ~3.5) the shrinkage formula leaves the seed at ~59% of the
+    # output. The one defence against a bad hand-written guess switched itself
+    # off exactly while the guess was still driving.
+    #
+    # So the flag is gated on the evidence outweighing the prior instead. In
+    # ref = (n_eff*observed + PRIOR_WEIGHT*prior) / (n_eff + PRIOR_WEIGHT) the
+    # prior's share of the output is PRIOR_WEIGHT / (n_eff + PRIOR_WEIGHT), so
+    # n_eff == PRIOR_WEIGHT is a 50/50 blend — still half seed, so not yet
+    # earned. The comparison is therefore <=: the penalty is released only once
+    # observed weight *exceeds* PRIOR_WEIGHT and the seed is a minority of the
+    # answer.
+    #
+    # It is also conditional on there being seed content to defend against. With
+    # no prior at all the reference is 100% observed, and when the prior is a
+    # price this model already learned from real comps (existing is_seed False)
+    # the shrinkage target is evidence too, not a guess — in both cases the
+    # penalty would be punishing a number nobody hand-wrote. Unknown history
+    # defaults to True, matching the read in the too-few-comps branch above:
+    # assuming "seed" is the cautious direction, since being wrong there only
+    # costs a few marginal alerts, while being wrong the other way is a week of
+    # false positives off a bad guess.
+    prior_is_seed = prior is not None and bool((existing or {}).get("is_seed", True))
+    is_seed = prior_is_seed and n_eff <= config.PRIOR_WEIGHT
+
     if not sane(ref):
         return None
 
@@ -323,19 +397,28 @@ def recompute_model_price(
         "raw_ref": round(raw_ref, 2),
         "shrunk": shrunk,
         "n_comps": len(comps),
+        # How many of n_comps this model actually owns, before borrowing from
+        # split-VRAM siblings. n_comps was reported to Telegram and to the
+        # dashboard's confidence badge as if it were this number, so a generic
+        # key holding zero comps of its own advertised "n=8" — the borrowed pool
+        # counted as evidence about a model it says nothing directly about. Both
+        # numbers are now written and n_own is the honest one.
+        "n_own": len(own),
         "n_sold": sum(1 for c in comps if c.source == "sold"),
         "n_reserved": sum(1 for c in comps if c.source == "reserved"),
         "median_days_to_sale": median_days,
         "buy_ceiling": round(config.SHIPPED.buy_ceiling(ref), 2),
         "buy_ceiling_in_person": round(config.IN_PERSON.buy_ceiling(ref), 2),
         "updated_at": now().isoformat(),
-        "is_seed": False,
+        "is_seed": is_seed,
     }
     db.upsert_model_price(row)
     log.info(
-        "%s: ref %.2f (raw %.2f%s) from %d comps (%d sold / %d reserved) -> ceiling %.2f shipped / %.2f in person",
+        "%s: ref %.2f (raw %.2f%s) from %d comps (%d own / %d sold / %d reserved)%s "
+        "-> ceiling %.2f shipped / %.2f in person",
         model_key, row["ref_price"], row["raw_ref"], " shrunk" if shrunk else "",
-        row["n_comps"], row["n_sold"], row["n_reserved"],
+        row["n_comps"], row["n_own"], row["n_sold"], row["n_reserved"],
+        " still seed-dominated" if is_seed else "",
         row["buy_ceiling"], row["buy_ceiling_in_person"],
     )
     return row
@@ -363,6 +446,12 @@ class Deal:
     net_shipped_at_asking: float | None = None
     is_seed: bool = False
     n_comps: int = 0
+    # How many of n_comps this model owns outright, before borrowing from its
+    # split-VRAM siblings. None means the model_prices row predates the column
+    # and the split is genuinely unknown — distinct from 0, which is the
+    # interesting case: a reference resting entirely on a sibling SKU's pool.
+    # The caption relies on that distinction, so do not default this to 0.
+    n_own: int | None = None
     # Provenance passthrough for the alert message — lets the owner see at a
     # glance whether a reference rests on real sales or just reservations,
     # and how long this model typically takes to move.
@@ -414,8 +503,11 @@ def evaluate(price: float, model_row: dict | None, bootstrap_cap: float | None) 
         if is_seed:
             # Recomputed rather than read from the row: a seeded ceiling is
             # only as good as the guess behind it, so it has to clear a higher
-            # bar until real comps replace it. This relaxes on its own the
-            # moment the model reaches MIN_COMPS.
+            # bar until real comps replace it. This relaxes on its own once
+            # recompute_model_price sees observed weight outweigh PRIOR_WEIGHT
+            # and clears is_seed — which is later than reaching MIN_COMPS, and
+            # deliberately so: at MIN_COMPS the seed is still the majority of
+            # ref_price (see the is_seed gate there).
             ceiling = _seeded_ceiling(config.SHIPPED, ref)
             ceiling_ip = _seeded_ceiling(config.IN_PERSON, ref)
         else:
@@ -441,6 +533,11 @@ def evaluate(price: float, model_row: dict | None, bootstrap_cap: float | None) 
             net_shipped_at_asking=config.SHIPPED.net_margin(price, ref),
             is_seed=is_seed,
             n_comps=int(model_row.get("n_comps") or 0),
+            # `or 0` would be wrong here: a genuine n_own of 0 (everything
+            # borrowed) and a missing column both have to survive as themselves.
+            n_own=(
+                int(model_row["n_own"]) if model_row.get("n_own") is not None else None
+            ),
             median_days_to_sale=(
                 float(model_row["median_days_to_sale"])
                 if model_row.get("median_days_to_sale") is not None

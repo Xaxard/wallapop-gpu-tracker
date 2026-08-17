@@ -50,6 +50,37 @@ def _sold_row(item_id, price, age_days=0.0):
     return {"item_id": item_id, "sold_price": price, "closed_at": closed_at}
 
 
+class _ObservationsDB(_FakeDB):
+    """Fake holding a raw `observations` table, active rows included.
+
+    _FakeDB hands back whatever list it was constructed with, which cannot prove
+    the "no asking prices in the pool" invariant: the status filter lives in
+    db.reserved_comps, so a fake that never sees an active row proves nothing
+    about what happens when one exists. This one stores the table and applies the
+    same predicate the real query does (status == 'reserved', inside the window,
+    newest first), so an active observation is genuinely offered to
+    collect_comps' input and genuinely has to be rejected.
+    """
+
+    def __init__(self, observations=None, **kwargs):
+        super().__init__(**kwargs)
+        self._observations = list(observations or [])
+
+    def reserved_comps(self, model_key, since):
+        rows = [
+            row
+            for row in self._observations
+            if row.get("status") == "reserved"
+            and pricing._parse_dt(row["seen_at"]) >= since
+        ]
+        return sorted(rows, key=lambda row: row["seen_at"], reverse=True)
+
+
+def _observation(item_id, price, status, age_days=0.0):
+    seen_at = (pricing.now() - timedelta(days=age_days)).isoformat()
+    return {"item_id": item_id, "price": price, "status": status, "seen_at": seen_at}
+
+
 # ------------------------------------------------------------------ margins
 def test_flat_floor_governs_cheap_items(monkeypatch):
     """Below the TARGET_MARGIN / MARGIN_RATE crossover (~278 EUR at the
@@ -260,6 +291,88 @@ def test_reserved_comp_sitting_for_weeks_still_counts_once():
     assert len(comps) == 1
 
 
+# ------------------------------------- only committed prices may become comps
+def test_an_active_asking_price_never_becomes_a_comp():
+    """The owner's requirement, verbatim: "The reference price must be taken from
+    reserved price graphics card ... cause people can ask whatever they want, but
+    i want to know the real selling price."
+
+    Three cards sitting at a 999 EUR ask and one actually reserved at 300 must
+    produce exactly one comp, worth 300. A pool of asks measures optimism.
+    """
+    db = _ObservationsDB(observations=[
+        _observation("ask1", 999.0, "active", age_days=1),
+        _observation("ask2", 950.0, "active", age_days=2),
+        _observation("ask3", 900.0, "active", age_days=3),
+        _observation("real", 300.0, "reserved", age_days=1),
+    ])
+    comps = pricing.collect_comps(db, "rtx_4070")
+    assert [(c.price, c.source) for c in comps] == [(300.0, "reserved")]
+
+
+def test_a_model_with_only_active_listings_has_no_comps_at_all():
+    """No committed price means no reference price — the model stays on its seed
+    and the bootstrap cap, rather than learning a price from asking prices."""
+    db = _ObservationsDB(observations=[
+        _observation(f"a{i}", 400.0, "active") for i in range(30)
+    ])
+    assert pricing.collect_comps(db, "rtx_4070") == []
+    assert pricing.recompute_model_price(db, "rtx_4070", None) is None
+    assert db.writes == []
+
+
+def test_the_same_item_asking_high_and_reserved_low_contributes_only_the_reservation():
+    """A listing whose ask was cut before it reserved must contribute the price
+    someone committed to, never the price it was hoping for."""
+    db = _ObservationsDB(observations=[
+        _observation("x", 500.0, "active", age_days=9),
+        _observation("x", 420.0, "active", age_days=5),
+        _observation("x", 300.0, "reserved", age_days=1),
+    ])
+    comps = pricing.collect_comps(db, "rtx_4070")
+    assert [c.price for c in comps] == [300.0]
+
+
+def test_comp_sane_reads_min_comp_price_not_min_sane_price(monkeypatch):
+    """The pool floor and the alert floor are separate knobs that only happen to
+    be equal at the defaults — moving one must not move the other."""
+    monkeypatch.setattr(config, "MIN_COMP_PRICE", 120.0)
+    assert not pricing.comp_sane(100.0)
+    assert pricing.sane(100.0)
+    assert pricing.comp_sane(120.0)
+    assert not pricing.comp_sane(None)
+    assert not pricing.comp_sane(config.MAX_SANE_PRICE + 1)
+
+
+@pytest.mark.parametrize("price,admitted", [
+    (4.0, False),      # the literal typo the requirement named
+    (40.0, False),     # not a typo: a dead card, a replica or a bare cooler
+    (49.99, False),
+    (50.0, True),      # MIN_COMP_PRICE itself is inclusive
+    (300.0, True),
+])
+def test_prices_below_min_comp_price_never_enter_the_pool(price, admitted):
+    """MIN_COMP_PRICE, not MIN_SANE_PRICE, is the pool's lower bound — and it
+    applies to both committed-price branches, reserved and sold alike. A real
+    40 EUR GPU drags the median down exactly as hard as a 4 EUR typo does.
+    """
+    reserved = pricing.collect_comps(_FakeDB(reserved=[_reserved_row("r", price)]), "rtx_4070")
+    sold = pricing.collect_comps(_FakeDB(sold=[_sold_row("s", price)]), "rtx_4070")
+    assert bool(reserved) is admitted
+    assert bool(sold) is admitted
+
+
+def test_raising_min_comp_price_tightens_the_pool_without_touching_the_alert_path(monkeypatch):
+    monkeypatch.setattr(config, "MIN_COMP_PRICE", 200.0)
+    db = _FakeDB(
+        reserved=[_reserved_row("cheap", 150.0), _reserved_row("ok", 300.0)],
+        sold=[_sold_row("cheap-sale", 180.0)],
+    )
+    assert [c.price for c in pricing.collect_comps(db, "rtx_4070")] == [300.0]
+    # ...while the alert path still evaluates a 150 EUR listing as it always did.
+    assert pricing.sane(150.0)
+
+
 # ------------------------------------------------------------- prior lookup
 def test_prior_price_prefers_own_existing_ref_price():
     db = _FakeDB(model_prices={"rtx_4060_ti_8g": {"ref_price": 999.0}})
@@ -360,6 +473,151 @@ def test_recompute_model_price_below_min_comps_writes_nothing():
     db = _FakeDB(reserved=[_reserved_row("only-one", 300.0)])
     assert pricing.recompute_model_price(db, "rtx_4070", None) is None
     assert db.writes == []
+
+
+# -------------------------------------------------- borrowed comps aren't "own"
+class _PerModelDB(_FakeDB):
+    """_FakeDB with per-model reserved/sold tables.
+
+    The shared-table fake returns the same rows for every model_key, which makes
+    a borrowed sibling comp indistinguishable from an owned one — precisely the
+    distinction n_own exists to record.
+    """
+
+    def __init__(self, reserved_by_model=None, sold_by_model=None, model_prices=None):
+        super().__init__(model_prices=model_prices)
+        self._reserved_by_model = reserved_by_model or {}
+        self._sold_by_model = sold_by_model or {}
+
+    def reserved_comps(self, model_key, since):
+        return list(self._reserved_by_model.get(model_key, []))
+
+    def sold_comps(self, model_key, since):
+        return list(self._sold_by_model.get(model_key, []))
+
+
+def test_n_own_reports_zero_when_the_whole_pool_was_borrowed(monkeypatch):
+    """A generic key with no comps of its own used to advertise the combined
+    sibling pool as its own evidence — "n=8" on a model that has observed
+    nothing. That number is printed as provenance in the Telegram alert and
+    drives the dashboard's confidence badge, so both overstated what is known.
+    n_comps stays the total the price was computed from; n_own is the honest one.
+    """
+    monkeypatch.setattr(pricing, "_time_decay", lambda age: 1.0)
+    db = _PerModelDB(reserved_by_model={
+        "rtx_4060_ti_8g": [_reserved_row(f"a{i}", 270.0) for i in range(4)],
+        "rtx_4060_ti_16g": [_reserved_row(f"b{i}", 330.0) for i in range(4)],
+    })
+
+    row = pricing.recompute_model_price(db, "rtx_4060_ti", None)
+
+    assert row is not None
+    assert row["n_comps"] == 8
+    assert row["n_own"] == 0
+
+
+def test_n_own_counts_only_this_models_comps_when_borrowing_tops_up(monkeypatch):
+    monkeypatch.setattr(pricing, "_time_decay", lambda age: 1.0)
+    db = _PerModelDB(reserved_by_model={
+        "rtx_4060_ti": [_reserved_row("own1", 300.0), _reserved_row("own2", 305.0)],
+        "rtx_4060_ti_8g": [_reserved_row(f"a{i}", 270.0) for i in range(3)],
+        "rtx_4060_ti_16g": [_reserved_row(f"b{i}", 330.0) for i in range(3)],
+    })
+
+    row = pricing.recompute_model_price(db, "rtx_4060_ti", None)
+
+    assert row["n_own"] == 2
+    assert row["n_comps"] == 8
+
+
+def test_n_own_equals_n_comps_when_nothing_was_borrowed(monkeypatch):
+    monkeypatch.setattr(pricing, "_time_decay", lambda age: 1.0)
+    db = _FakeDB(reserved=[_reserved_row(f"r{i}", 300.0) for i in range(config.MIN_COMPS)])
+    row = pricing.recompute_model_price(db, "rtx_4070", None)
+    assert row["n_own"] == row["n_comps"] == config.MIN_COMPS
+
+
+# ------------------------------------------- is_seed tracks the written number
+def test_first_recompute_off_a_thin_decayed_pool_stays_seeded():
+    """BUG THIS PINS: is_seed was hardcoded False on the first successful
+    recompute, but the value written is shrunk toward the prior and on a first
+    run the prior *is* the seed. A month-old pool of five reserved comps carries
+    an n_eff of well under 1 against PRIOR_WEIGHT=5, so the seed is the
+    overwhelming majority of ref_price — and SEED_MARGIN_MULTIPLIER, the only
+    defence against a bad hand-written guess, was switched off right there.
+
+    Deliberately does *not* pin _time_decay: the decay is the point.
+    """
+    reserved = [_reserved_row(f"r{i}", 300.0, age_days=30) for i in range(config.MIN_COMPS)]
+    db = _FakeDB(reserved=reserved)
+    existing = {"ref_price": 500.0, "is_seed": True}
+
+    row = pricing.recompute_model_price(db, "rtx_4070", existing)
+
+    assert row is not None
+    assert row["is_seed"] is True
+    # ...and the flag is telling the truth: the output is still mostly the seed.
+    assert abs(row["ref_price"] - 500.0) < abs(row["ref_price"] - 300.0)
+
+
+def test_a_fat_recent_pool_clears_the_seed_flag(monkeypatch):
+    monkeypatch.setattr(pricing, "_time_decay", lambda age: 1.0)
+    reserved = [_reserved_row(f"r{i}", 300.0) for i in range(60)]
+    db = _FakeDB(reserved=reserved)
+    existing = {"ref_price": 500.0, "is_seed": True}
+
+    row = pricing.recompute_model_price(db, "rtx_4070", existing)
+
+    assert row["is_seed"] is False
+    assert abs(row["ref_price"] - 300.0) < abs(row["ref_price"] - 500.0)
+
+
+@pytest.mark.parametrize("n_sold,expect_seed", [(7, True), (8, False)])
+def test_the_seed_flag_releases_only_once_evidence_outweighs_the_prior(
+    monkeypatch, n_sold, expect_seed
+):
+    """The comparison is n_eff <= PRIOR_WEIGHT, and the boundary is deliberate.
+    The prior's share of the blend is PRIOR_WEIGHT / (n_eff + PRIOR_WEIGHT), so
+    at n_eff == PRIOR_WEIGHT the answer is still exactly half seed — not earned.
+
+    Arithmetic, with decay pinned to 1 and SOLD_WEIGHT=1: trimming drops k=1 from
+    each end, so 7 sold comps leave 5 (n_eff = 5.0, exactly PRIOR_WEIGHT, still
+    seeded) and 8 leave 6 (n_eff = 6.0, released).
+    """
+    monkeypatch.setattr(pricing, "_time_decay", lambda age: 1.0)
+    monkeypatch.setattr(config, "SOLD_WEIGHT", 1.0)
+    monkeypatch.setattr(config, "PRIOR_WEIGHT", 5.0)
+    db = _FakeDB(sold=[_sold_row(f"s{i}", 300.0 + i) for i in range(n_sold)])
+
+    row = pricing.recompute_model_price(db, "rtx_4070", {"ref_price": 500.0, "is_seed": True})
+    assert row["is_seed"] is expect_seed
+
+
+def test_a_purely_observed_reference_is_never_flagged_as_a_seed():
+    """No prior at all means ref_price is 100% observed — there is no guess to
+    demand extra margin against, however thin the pool is."""
+    reserved = [_reserved_row(f"r{i}", 300.0, age_days=40) for i in range(config.MIN_COMPS)]
+    db = _FakeDB(reserved=reserved)  # leaf SKU: no existing row, no siblings
+
+    row = pricing.recompute_model_price(db, "rtx_4070", None)
+
+    assert row["shrunk"] is False
+    assert row["is_seed"] is False
+
+
+def test_the_seed_flag_does_not_come_back_once_a_price_has_been_learned():
+    """A one-way ratchet on purpose. Once real comps outweighed the seed the
+    stored price is evidence, so shrinking toward it later is shrinking toward
+    evidence — re-imposing the seed penalty would be punishing a number nobody
+    hand-wrote."""
+    reserved = [_reserved_row(f"r{i}", 300.0, age_days=30) for i in range(config.MIN_COMPS)]
+    db = _FakeDB(reserved=reserved)
+    learned = {"ref_price": 310.0, "is_seed": False}
+
+    row = pricing.recompute_model_price(db, "rtx_4070", learned)
+
+    assert row["shrunk"] is True
+    assert row["is_seed"] is False
 
 
 # ----------------------------------------------------------- time to sale

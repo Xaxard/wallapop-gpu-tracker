@@ -65,14 +65,22 @@ class Database:
         )
         return res.data or []
 
-    # ------------------------------------------------------------- listings
-    # Columns this process has learned the live table does not have. Code and
-    # schema deploy independently here: a push reaches the runner within
-    # minutes while schema.sql is applied by hand, so for a while the code
-    # writes columns that do not exist yet. Without this, that window is a hard
-    # outage — PostgREST rejects the whole batch with PGRST204 and every
-    # listing in the run is lost, rather than just the new field.
-    _missing_columns: set[str] = set()
+    # ----------------------------------------------------------- schema drift
+    # Columns this process has learned the live table does not have, keyed by
+    # table. Code and schema deploy independently here: a push reaches the
+    # runner within minutes while schema.sql is applied by hand, so for a while
+    # the code writes columns that do not exist yet. Without this, that window
+    # is a hard outage — PostgREST rejects the whole batch with PGRST204 and
+    # every row in the run is lost, rather than just the new field.
+    #
+    # Keyed per table rather than one flat set. It was a single class-level set
+    # while only `listings` used this, which was harmless and stopped being so
+    # the moment a second table routed through it: a column missing on one table
+    # says nothing about another, so one PGRST204 from `model_prices` would have
+    # gone on stripping a same-named, perfectly real column out of every later
+    # `listings` payload for the life of the process — silent data loss, which is
+    # strictly worse than the outage this machinery exists to prevent.
+    _missing_columns: dict[str, set[str]] = {}
 
     @staticmethod
     def _unknown_column(exc: Exception) -> str | None:
@@ -85,29 +93,60 @@ class Database:
         )
         return match.group(1) if match else None
 
+    def _upsert_tolerating_drift(
+        self,
+        table: str,
+        rows: list[dict],
+        *,
+        on_conflict: str,
+        ignore_duplicates: bool = False,
+    ) -> None:
+        """Upsert `rows`, dropping any column the live table does not have yet.
+
+        Shared by every writer whose payload has grown through ALTER
+        statements. It started life inside upsert_listings, which is where it was
+        needed first — but the row pricing.recompute_model_price writes carries
+        six ALTER-added columns of its own (raw_ref, shrunk, median_days_to_sale,
+        n_sold, n_reserved, n_own) and had no such protection, so one un-applied
+        migration crashed the comps loop on every single model instead of
+        degrading to the columns that do exist. Degrading is clearly right here:
+        a reference price missing its provenance fields is still a reference
+        price, while a crashed comps run leaves every buy ceiling stale.
+
+        The retry loop terminates because each pass either succeeds, learns a
+        new missing column, or re-raises on a column it has already dropped.
+        """
+        if not rows:
+            return
+        missing = self._missing_columns.setdefault(table, set())
+        payload = [{k: v for k, v in row.items() if k not in missing} for row in rows]
+        while True:
+            try:
+                self.c.table(table).upsert(
+                    payload,
+                    on_conflict=on_conflict,
+                    ignore_duplicates=ignore_duplicates,
+                ).execute()
+                return
+            except Exception as exc:
+                column = self._unknown_column(exc)
+                if column is None or column in missing:
+                    raise
+                log.warning(
+                    "%s has no column %r yet — dropping it and retrying. "
+                    "Apply the ALTER statements in schema.sql to persist it.",
+                    table,
+                    column,
+                )
+                missing.add(column)
+                payload = [
+                    {k: v for k, v in row.items() if k != column} for row in payload
+                ]
+
+    # ------------------------------------------------------------- listings
     def upsert_listings(self, rows: list[dict]) -> None:
         for batch in chunked(rows):
-            payload = [
-                {k: v for k, v in row.items() if k not in self._missing_columns}
-                for row in batch
-            ]
-            while True:
-                try:
-                    self.c.table("listings").upsert(payload, on_conflict="item_id").execute()
-                    break
-                except Exception as exc:
-                    column = self._unknown_column(exc)
-                    if column is None or column in self._missing_columns:
-                        raise
-                    log.warning(
-                        "listings has no column %r yet — dropping it and retrying. "
-                        "Apply the ALTER statements in schema.sql to persist it.",
-                        column,
-                    )
-                    self._missing_columns.add(column)
-                    payload = [
-                        {k: v for k, v in row.items() if k != column} for row in payload
-                    ]
+            self._upsert_tolerating_drift("listings", list(batch), on_conflict="item_id")
 
     def get_listings(self, item_ids: Sequence[str]) -> dict[str, dict]:
         out: dict[str, dict] = {}
@@ -206,31 +245,54 @@ class Database:
     def sold_comps(self, model_key: str, since: datetime) -> list[dict]:
         """Listings inferred sold (reserved, then gone) inside the window.
 
-        `whole_machine` rows are excluded: a gaming laptop or a prebuilt that
-        sold for 900 EUR is a real transaction, but it is not a transaction in
-        the loose card its title names, and letting it into the pool moves the
-        reference price by a whole tier.
+        Also the source of the listed-at/closed-at pairs behind
+        median_days_to_sale — hence first_seen/posted_at in the select. There
+        used to be a second method (`sold_durations`) that returned
+        `self.sold_comps(...)` verbatim under a different docstring, and the
+        comps loop called both, running this exact query twice per model
+        (~80 redundant round trips a run). One query, one caller, rows passed
+        through to pricing.time_to_sale_days.
+
+        Two exclusions, and they are the whole reason this is not a bare
+        `select where last_status='closed'`:
+
+        `whole_machine` rows are out: a gaming laptop or a prebuilt that sold
+        for 900 EUR is a real transaction, but it is not a transaction in the
+        loose card its title names, and letting it into the pool moves the
+        reference price by a whole tier. The predicate is NULL-tolerant because
+        `= false` is not: in Postgres it drops NULLs, and every listing written
+        before that column existed — or during a window where
+        `_missing_columns` had stripped it from the payload — carries NULL
+        there and was permanently invisible to this query. schema.sql now
+        backfills and NOT NULLs the column so the invariant is true at the
+        storage layer too; this side stays tolerant for the rows already in
+        flight.
+
+        Low-confidence rows are out as well, which is the guard this query was
+        missing entirely. `reserved_comps` reads observations.model_key, which
+        both loops populate only when `match.priceable` (high/medium) — but
+        this one reads listings.model_key, which the loops set at *any*
+        confidence. A bare-number or wrong-vendor misclassification — exactly
+        what models._confidence exists to catch — was therefore barred from the
+        reserved pool and then walked straight into the sold pool at
+        SOLD_WEIGHT=1.0, the heaviest weight in the model. `in (high, medium)`
+        also excludes NULL, which is correct: confidence is only NULL when
+        model_key is NULL, and such a row cannot match the model_key filter
+        above anyway.
         """
         res = (
             self.c.table("listings")
             .select("item_id,sold_price,closed_at,first_seen,posted_at")
             .eq("model_key", model_key)
+            .in_("confidence", ["high", "medium"])
             .eq("last_status", "closed")
             .not_.is_("sold_price", "null")
-            .eq("whole_machine", False)
+            .or_("whole_machine.is.null,whole_machine.eq.false")
             .gte("closed_at", iso(since))
             .limit(PAGE)
             .execute()
         )
         return res.data or []
-
-    def sold_durations(self, model_key: str, since: datetime) -> list[dict]:
-        """Listed-at / closed-at pairs, for median days-to-sale.
-
-        Prefers the seller's real `posted_at` over `first_seen`, which is only
-        when this bot happened to notice the listing.
-        """
-        return self.sold_comps(model_key, since)
 
     def open_reserved_listings(self, model_keys: Sequence[str]) -> list[dict]:
         """Reserved listings we still believe are live, for direct liveness checks.
@@ -291,7 +353,12 @@ class Database:
         return {row["model_key"]: row for row in (res.data or [])}
 
     def upsert_model_price(self, row: dict) -> None:
-        self.c.table("model_prices").upsert(row, on_conflict="model_key").execute()
+        # Routed through the drift-tolerant writer for the same reason listings
+        # is: the row pricing.recompute_model_price builds carries six
+        # ALTER-added columns, and this used to be a plain upsert that turned
+        # one un-applied migration into "recompute failed for <model>" on every
+        # single model, every run.
+        self._upsert_tolerating_drift("model_prices", [row], on_conflict="model_key")
 
     # ----------------------------------------------------------- sent_alerts
     def alerted_prices(self, item_ids: Sequence[str]) -> dict[str, list[float]]:
@@ -330,36 +397,32 @@ class Database:
         rows in 16 days — 97% of the database and the reason the free-tier
         quota ran out — while carrying only a few thousand distinct listings.
 
-        Dedup is done by reading back which listings are already recorded
-        rather than by an upsert, so it needs no unique index and works against
-        the existing table immediately — the same shape as alerted_prices().
+        Dedup is an upsert against the unique index on item_id, not a read-back
+        followed by an insert. The read-back version had a race it lost
+        routinely: both loops run overlapping schedules over a shared discovery
+        keyword space, so both see the same new junk listing within seconds of
+        each other. Whenever the other loop inserted between this loop's
+        read-back and its own insert, the insert hit the unique index and raised
+        a duplicate-key error — inside the main try of both loops, so the result
+        was a crashed run, a Telegram error ping and a re-raise, over a table
+        whose only purpose is filter tuning.
+
+        ignore_duplicates makes that collision the no-op it always should have
+        been, and removes the read-back round trips (one per 200 ids, every run)
+        along with it. Same pattern as record_alert().
         """
         if not rows:
             return
         deduped = {r["item_id"]: r for r in rows if r.get("item_id")}
         if not deduped:
             return
-
-        known: set[str] = set()
-        for batch in chunked(list(deduped), 200):
-            try:
-                res = (
-                    self.c.table("junk_exclusions")
-                    .select("item_id")
-                    .in_("item_id", list(batch))
-                    .limit(PAGE)
-                    .execute()
-                )
-                known.update(r["item_id"] for r in (res.data or []))
-            except Exception as exc:
-                # Better to risk a duplicate than to lose the audit trail.
-                log.warning("junk dedup lookup failed: %s", exc)
-
-        fresh = [row for iid, row in deduped.items() if iid not in known]
-        if not fresh:
-            return
-        for batch in chunked(fresh):
-            self.c.table("junk_exclusions").insert(list(batch)).execute()
+        for batch in chunked(list(deduped.values())):
+            self._upsert_tolerating_drift(
+                "junk_exclusions",
+                list(batch),
+                on_conflict="item_id",
+                ignore_duplicates=True,
+            )
 
     def purge_old_junk(self) -> None:
         """Junk rows past the retention horizon.
@@ -427,11 +490,19 @@ class Database:
         )
 
     def recent_runs(self, loop_name: str, limit: int) -> list[dict]:
-        """Last N finished runs, newest first — input to the dead-man switch."""
+        """Last N finished runs, newest first — input to the dead-man switch.
+
+        `notes` is in the select list because the dead-man switch has no state
+        of its own: once tripped it fired a Telegram message every single run,
+        so a weekend outage was ~1000 identical messages. The cooldown is
+        implemented by writing a marker into run_log.notes and looking for it in
+        the recent history, which only works if the history actually carries the
+        column.
+        """
         try:
             res = (
                 self.c.table("run_log")
-                .select("id,items_seen,alerts_sent,errors,started_at,finished_at")
+                .select("id,items_seen,alerts_sent,errors,started_at,finished_at,notes")
                 .eq("loop_name", loop_name)
                 .not_.is_("finished_at", "null")
                 .order("started_at", desc=True)

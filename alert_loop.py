@@ -11,6 +11,8 @@ import statistics
 import sys
 import time
 import traceback
+from datetime import datetime, timedelta
+from typing import Iterable
 
 import config
 import junk
@@ -22,8 +24,28 @@ from wallapop_client import Item, WallapopClient
 
 log = logging.getLogger("alert")
 
+# How long main(--loop) waits after a failed pass, and the ceiling that wait
+# backs off to. See main() for why a failed pass must not end the process.
+LOOP_BACKOFF_CAP_SECONDS = 15 * 60.0
 
-def _listing_row(item: Item, match: models.Match) -> dict:
+
+def listing_row(item: Item, match: models.Match) -> dict:
+    """The `listings` row for one observed item. Shared by both loops.
+
+    This function existed twice — once per loop — and the two copies drifted,
+    which is the argument for it existing once. Only the alert loop's copy
+    wrote `country`, so the row shape the database saw depended on which loop
+    happened to touch a listing last: a listing first seen by the comps loop
+    had a NULL country until the alert loop happened to see it too, and the
+    PGRST204 drift-tolerance path in Database.upsert_listings fired (or didn't)
+    depending on load order rather than on the schema. Both loops feed the same
+    table for the same downstream consumers, so there is no version of this
+    where they should disagree about which columns they fill.
+
+    It lives in alert_loop.py because comps_loop already imports from here
+    (`_check_dead_man`), so the dependency direction is established and no new
+    module is needed for two functions.
+    """
     return {
         "item_id": item.item_id,
         "title": item.title[:500],
@@ -48,7 +70,53 @@ def _listing_row(item: Item, match: models.Match) -> dict:
         "whole_machine": item.whole_machine,
         "posted_at": iso(item.posted_at) if item.posted_at else None,
         "user_allows_shipping": item.user_allows_shipping,
+        # The seller id is the only identifier stable across relistings: a
+        # replica or empty-box listing reappears under a fresh item_id every
+        # few days, which the (item_id, price) alert dedup cannot see at all.
+        # Persisted from both loops so BLOCKED_SELLERS can be maintained from
+        # what the database actually holds rather than from memory.
+        "seller_id": getattr(item, "seller_id", None),
+        # "Seller just edited this" — a price cut on a listing that never
+        # alerted is otherwise completely invisible, because _decide_kind can
+        # only compare against our own alert history. It also means a live
+        # seller, which is most of whether an offer gets answered at all.
+        "modified_at": iso(item.modified_at) if getattr(item, "modified_at", None) else None,
     }
+
+
+def upsert_listing_batches(
+    db: Database, pairs: Iterable[tuple[Item, models.Match]]
+) -> None:
+    """Write listing rows, splitting reserved from non-reserved. Both loops.
+
+    `ever_reserved` is sticky and must stay that way: PostgREST's upsert only
+    updates the columns present in the payload, so *omitting* the column
+    preserves whatever is already stored, while sending `False` would wipe the
+    single most valuable fact about a listing. Hence two batches — the
+    non-reserved one simply does not mention the column.
+
+    The comps loop has done this since the phantom-sale incident; the alert
+    loop never did, and that was the more damaging half. `infer_sales` falls
+    back to `last_status == 'reserved'`, which covers the common case, but a
+    listing that goes reserved, un-reserves and then vanishes closes with
+    `sold_price = None` and yields no comp at all. The 5-minute loop is the one
+    that catches short-lived listings, and short-lived listings are the ones
+    that actually sold — so the fast loop was silently dropping exactly the
+    comps worth the most.
+    """
+    reserved_rows: list[dict] = []
+    active_rows: list[dict] = []
+    for item, match in pairs:
+        row = listing_row(item, match)
+        if item.reserved:
+            row["ever_reserved"] = True
+            reserved_rows.append(row)
+        else:
+            active_rows.append(row)
+    if reserved_rows:
+        db.upsert_listings(reserved_rows)
+    if active_rows:
+        db.upsert_listings(active_rows)
 
 
 def _relevant(search: dict, match: models.Match) -> bool:
@@ -94,6 +162,23 @@ def _enrich(wp: WallapopClient, item: Item) -> Item:
     return item
 
 
+def _seller_blocked(item: Item) -> bool:
+    """Whether this listing's seller may never trigger an alert.
+
+    The signal exists because the alert dedup is keyed on (item_id, price) and
+    a serial relister defeats it completely: the same replica card or empty box
+    comes back under a fresh item_id every few days, alerts as brand new every
+    time, and no amount of price history helps. The seller id is the only thing
+    that survives the relisting.
+
+    `seller_id` is read through getattr because it is a recent addition to
+    Item; a build without it simply has no seller signal to enforce, which is
+    the pre-existing behaviour rather than a crash.
+    """
+    seller_id = getattr(item, "seller_id", None)
+    return bool(seller_id) and str(seller_id) in config.BLOCKED_SELLERS
+
+
 def _alert_latency(item: Item) -> float | None:
     """Seconds from the seller pressing publish to us deciding to alert.
 
@@ -128,6 +213,8 @@ def run_once() -> dict:
         "errors": 0,
         "over_cap": 0,
         "blocked_condition": 0,
+        "blocked_seller": 0,
+        "whole_machine": 0,
         "latency_samples": [],
     }
     telegram = Telegram()
@@ -225,49 +312,100 @@ def run_once() -> dict:
             for item, match, _ in found.values()
             if item.price is not None
         ]
-        db.upsert_listings([_listing_row(i, m) for i, m, _ in found.values()])
+        upsert_listing_batches(db, ((i, m) for i, m, _ in found.values()))
         stats["observations"] = db.insert_changed_observations(
             observation_rows, prior_states
         )
 
-        # Reserved listings price the market but you can't buy them.
+        # What this pre-filter may decide is now limited to what can be decided
+        # *without* a reference price. The price cap moved into the loop below,
+        # because which cap applies is not knowable until the model_prices
+        # lookup has happened — and applying the low one to everything was
+        # throwing away the largest trades by construction. A 4080 at 420 EUR
+        # against a 620 EUR reference has to clear a 112 EUR required margin
+        # and a ~468 EUR shipped buy ceiling: a better trade than anything the
+        # flat 350 cap ever admitted, dropped here without being evaluated.
         #
-        # MAX_ALERT_PRICE is a scope decision applied to the raw asking price
-        # before any margin maths: above it the capital at risk stops being
-        # worth it. It also removes the need to identify whole PCs and gaming
-        # laptops in the alert path at all — a machine with a card in it is
-        # essentially never listed this cheap, so the cap filters them out on
-        # price without ever having to guess at form factor from a title.
-        candidates = {
-            iid: v
-            for iid, v in found.items()
-            if not v[0].reserved
-            and v[0].price is not None
-            and float(v[0].price) <= config.MAX_ALERT_PRICE
-        }
-        over_cap = sum(
-            1
-            for v in found.values()
-            if v[0].price is not None and float(v[0].price) > config.MAX_ALERT_PRICE
-        )
-        stats["over_cap"] = over_cap
+        # Reserved listings still go: they price the market, but you can't buy
+        # one. Neither can an unpriced listing be evaluated at all.
+        #
+        # Whole machines now get rejected explicitly, and this is the part the
+        # raised cap makes load-bearing. The flat 350 was quietly doing two
+        # jobs — bounding capital *and* keeping prebuilts and gaming laptops
+        # out of the feed without identifying them, since a machine with a card
+        # in it is essentially never listed that cheap. MAX_CAPITAL_PRICE at
+        # 700 is squarely inside prebuilt territory, so that second job has to
+        # be done on purpose now: off the `whole_machine` taxonomy flag, which
+        # is already computed on every Item and already persisted on every row.
+        # Note this is a *scope* rejection, not a claim the listing is bad — a
+        # card inside a PC can be a fine buy, it just isn't a trade this bot
+        # prices, because the reference price it would be judged against is the
+        # loose card's.
+        #
+        # A blocked seller is rejected here too, which is the cheapest place it
+        # can possibly happen: before the dedup lookup, before the margin
+        # maths, and before the detail request.
+        candidates: dict[str, tuple[Item, models.Match, dict]] = {}
+        for iid, entry in found.items():
+            candidate = entry[0]
+            if candidate.reserved or candidate.price is None:
+                continue
+            if candidate.whole_machine:
+                stats["whole_machine"] += 1
+                continue
+            if _seller_blocked(candidate):
+                stats["blocked_seller"] += 1
+                log.info(
+                    "skip %s — blocked seller %s: %s",
+                    iid, getattr(candidate, "seller_id", None), candidate.title[:50],
+                )
+                continue
+            candidates[iid] = entry
+
         log.info(
-            "%d candidates under %.0f EUR (%d listings priced above the cap)",
-            len(candidates), config.MAX_ALERT_PRICE, over_cap,
+            "%d candidates to evaluate (%d whole machines and %d blocked-seller "
+            "listings dropped)",
+            len(candidates), stats["whole_machine"], stats["blocked_seller"],
         )
         already = db.alerted_prices(list(candidates))
         detail_client = WallapopClient()
+        # Rows to write back once the detail endpoint has filled them in — see
+        # the batched re-upsert after this loop.
+        enriched_rows: list[dict] = []
 
         for item, match, search in candidates.values():
-            kind = _decide_kind(float(item.price), already.get(item.item_id, []))
-            if kind is None:
-                continue
-
             model_row = (
                 model_prices.get(match.model_key)
                 if match.priceable and match.model_key
                 else None
             )
+
+            # Two caps, and which one applies is exactly the question this loop
+            # position exists to answer. With a reference price behind it the
+            # margin gate is a real test, so the only remaining job for a cap
+            # is bounding capital at risk on one purchase (MAX_CAPITAL_PRICE).
+            # Without one there is nothing but a keyword match, so the flat
+            # bootstrap ceiling (MAX_ALERT_PRICE) is the only protection there
+            # is. The truthiness test matches pricing.evaluate's own
+            # `model_row.get("ref_price")` check exactly, so a row that exists
+            # with a null/zero reference takes the bootstrap path in both
+            # places rather than getting the generous cap and then failing the
+            # gate for a different reason.
+            has_ref = bool(model_row and model_row.get("ref_price"))
+            cap = config.MAX_CAPITAL_PRICE if has_ref else config.MAX_ALERT_PRICE
+            if float(item.price) > cap:
+                stats["over_cap"] += 1
+                log.debug(
+                    "skip %s — %.0f EUR over the %.0f EUR %s cap: %s",
+                    item.item_id, item.price, cap,
+                    "capital" if has_ref else "bootstrap", item.title[:40],
+                )
+                continue
+
+            kind = _decide_kind(float(item.price), already.get(item.item_id, []))
+            if kind is None:
+                continue
+
             deal = pricing.evaluate(
                 float(item.price), model_row, search.get("max_price")
             )
@@ -276,6 +414,20 @@ def run_once() -> dict:
                 continue
 
             item = _enrich(detail_client, item)
+            enriched_rows.append(listing_row(item, match))
+
+            # Form factor is re-checked against the detail payload. The search
+            # response usually carries a taxonomy, but not always, and the
+            # detail endpoint is the authoritative one — so a prebuilt whose
+            # search result arrived untaxonomised is caught here instead of
+            # walking through the higher cap.
+            if item.whole_machine:
+                stats["whole_machine"] += 1
+                log.info(
+                    "skip %s — whole machine (taxonomy %s): %s",
+                    item.item_id, list(item.taxonomy), item.title[:50],
+                )
+                continue
 
             # Only the bottom tier is blocked. `fair` deliberately stays: a
             # cosmetic flaw on a card that still works is exactly the discount
@@ -322,6 +474,27 @@ def run_once() -> dict:
                 if not config.DRY_RUN:
                     db.record_alert(item.item_id, float(item.price), kind)
 
+        # Everything _enrich paid a request for used to be thrown away. The
+        # listings upsert happens ~50 lines above this point, so the condition,
+        # brand, seller-shipping flag and detail taxonomy fetched per qualifying
+        # listing were used for the alert caption and the block check and then
+        # dropped: no condition value ever reached the database, the dashboard
+        # had nothing to show, and "which conditions produced good buys" was
+        # unanswerable after the fact. This is a handful of rows per run (only
+        # listings that already cleared the margin gate get enriched), and it is
+        # one batched write rather than one per listing.
+        #
+        # These rows deliberately carry no `ever_reserved`: every candidate is
+        # non-reserved by construction, and the column's stickiness depends on
+        # not being mentioned.
+        if enriched_rows:
+            db.upsert_listings(enriched_rows)
+
+        log.info(
+            "%d listings rejected on the price cap (%.0f EUR with a reference "
+            "price, %.0f EUR without)",
+            stats["over_cap"], config.MAX_CAPITAL_PRICE, config.MAX_ALERT_PRICE,
+        )
         return stats
 
     except Exception:
@@ -337,7 +510,9 @@ def run_once() -> dict:
         samples = stats["latency_samples"]
         notes = (
             f"junk_filtered={stats['junk']} over_cap={stats['over_cap']} "
-            f"blocked_condition={stats['blocked_condition']}"
+            f"blocked_condition={stats['blocked_condition']} "
+            f"blocked_seller={stats['blocked_seller']} "
+            f"whole_machine={stats['whole_machine']}"
         )
         if samples:
             notes += f" median_latency_s={statistics.median(samples):.0f}"
@@ -350,7 +525,7 @@ def run_once() -> dict:
         )
         # Runs after finish_run so this run's own row counts toward the streak.
         try:
-            _check_dead_man(db, telegram)
+            _check_dead_man(db, telegram, run_id=run_id, notes=notes)
         except Exception:
             log.warning("dead-man check failed", exc_info=True)
         if detail_client is not None:
@@ -358,7 +533,63 @@ def run_once() -> dict:
         telegram.close()
 
 
-def _check_dead_man(db: Database, telegram: Telegram, loop_name: str = "alert") -> None:
+# Marker written into run_log.notes when the dead-man switch fires, and read
+# back on later runs to suppress a repeat. run_log is already the state this
+# check reads, so the cooldown needs no new table and no local file — which is
+# the only thing that can work here: every pass is a fresh GitHub Actions runner
+# with no memory of the last one, so in-process state would suppress nothing.
+DEAD_MAN_MARKER = "dead_man_warned"
+
+# How long the switch stays quiet after firing. Once tripped it stays tripped
+# until a human fixes it, and it fired on every subsequent run: a weekend
+# outage at the 5-minute cadence is ~1000 identical messages, which is precisely
+# how an alert channel stops being read — and an unread channel is the same
+# outage the dead-man switch exists to prevent. One message every 6 hours still
+# surfaces the failure on the day it happens.
+DEAD_MAN_COOLDOWN_HOURS = 6.0
+
+# How much run history to read to find a previous warning. The cooldown can only
+# be as long as the window it can see: 60 runs is ~5h at the 5-minute Actions
+# cadence, so the cooldown degrades gracefully (one extra message rather than
+# silence) instead of the read growing without bound — 6 hours of a 45s --loop
+# cadence would be 480 rows every single pass.
+DEAD_MAN_HISTORY_RUNS = 60
+
+
+def _parse_run_time(value: object) -> datetime | None:
+    """Best-effort parse of a run_log timestamp; Supabase returns ISO strings."""
+    if value is None:
+        return None
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _warned_within_cooldown(runs: list[dict], cutoff: datetime) -> bool:
+    """Whether a run at or after `cutoff` already carried the dead-man marker."""
+    for run in runs:
+        if DEAD_MAN_MARKER not in (run.get("notes") or ""):
+            continue
+        stamp = _parse_run_time(run.get("started_at") or run.get("finished_at"))
+        # An unparsable timestamp on a marked row counts as recent. Every row
+        # here came out of the newest-first history window, so it is recent by
+        # construction; the only question was whether it is inside the cooldown,
+        # and for a warning that otherwise repeats forever, staying quiet is the
+        # safer answer to "we can't tell".
+        if stamp is None or stamp >= cutoff:
+            return True
+    return False
+
+
+def _check_dead_man(
+    db: Database,
+    telegram: Telegram,
+    loop_name: str = "alert",
+    *,
+    run_id: int | None = None,
+    notes: str = "",
+) -> None:
     """Warn when a loop has gone quiet rather than actually broken.
 
     The realistic failure here is silent, not loud: a request starts coming
@@ -370,20 +601,43 @@ def _check_dead_man(db: Database, telegram: Telegram, loop_name: str = "alert") 
     covered by this check. Nothing surfaced it; the alert feed looked normal
     because a separate code path was still feeding the comps pool. Both loops
     are covered now.
+
+    Firing is rate-limited via `run_log.notes`: a warning writes
+    DEAD_MAN_MARKER into this run's row, and a later run that finds the marker
+    inside DEAD_MAN_COOLDOWN_HOURS logs instead of messaging. The marker write
+    is a second `finish_run` update rather than a field on the first one, and
+    that ordering is forced: the streak has to include this run's own row,
+    which only exists once finish_run has written it. The cost is that
+    `finished_at` is rewritten a few milliseconds later on a warning run, which
+    nothing reads to that precision.
     """
-    runs = db.recent_runs(loop_name, config.DEAD_MAN_RUNS)
-    if len(runs) < config.DEAD_MAN_RUNS:
+    runs = db.recent_runs(loop_name, max(config.DEAD_MAN_RUNS, DEAD_MAN_HISTORY_RUNS))
+    streak = runs[: config.DEAD_MAN_RUNS]
+    if len(streak) < config.DEAD_MAN_RUNS:
         return
-    if all(int(r.get("items_seen") or 0) == 0 for r in runs):
-        log.error(
-            "dead-man switch: %d consecutive %s runs saw zero items", len(runs), loop_name
+    if not all(int(r.get("items_seen") or 0) == 0 for r in streak):
+        return
+
+    log.error(
+        "dead-man switch: %d consecutive %s runs saw zero items", len(streak), loop_name
+    )
+    if _warned_within_cooldown(runs, now() - timedelta(hours=DEAD_MAN_COOLDOWN_HOURS)):
+        log.info(
+            "dead-man warning already sent within %.0fh — staying quiet",
+            DEAD_MAN_COOLDOWN_HOURS,
         )
-        telegram.send_error(
-            f"{config.DEAD_MAN_RUNS} consecutive {loop_name} runs returned zero "
-            "listings.\nEither the API response shape changed or the requests are "
-            "geolocating outside the marketplace — run smoke_test.py and check the "
-            "'No items parsed' warnings for the section type."
-        )
+        return
+
+    telegram.send_error(
+        f"{config.DEAD_MAN_RUNS} consecutive {loop_name} runs returned zero "
+        "listings.\nEither the API response shape changed or the requests are "
+        "geolocating outside the marketplace — run smoke_test.py, which sends "
+        "the same time_filter the loops do and prints it, and check the "
+        f"'No items parsed' warnings for the section type.\nFurther warnings "
+        f"suppressed for {DEAD_MAN_COOLDOWN_HOURS:.0f}h."
+    )
+    if run_id is not None:
+        db.finish_run(run_id, notes=f"{notes} {DEAD_MAN_MARKER}".strip())
 
 
 def main() -> None:
@@ -394,10 +648,47 @@ def main() -> None:
     matter what, so a 45s cadence lands near the floor while a 5-minute one
     adds ~2.5 minutes of pure waiting. Under GitHub Actions the default
     single-pass mode is still correct.
+
+    The two modes want opposite things from a failure, which is why the `try`
+    is conditional rather than universal:
+
+      * single pass: re-raise. GitHub Actions decides whether the chain is
+        healthy from the exit code, so swallowing a failure there would turn a
+        broken deploy into a green build that alerts nobody.
+      * `--loop`: log, back off, keep going. Persistent-host mode previously
+        had no `try` at all around `while True`, so one transient Supabase blip
+        — a connection reset, a 500, a statement timeout — ended the process
+        permanently and silently, and the halved time-to-alert that is the
+        entire point of this mode could not be relied on. run_once() already
+        pings Telegram before re-raising, so the failure is never invisible.
+
+    The backoff doubles per consecutive failure up to LOOP_BACKOFF_CAP_SECONDS
+    so a hard outage (expired credentials, an API shape change) doesn't become
+    a tight crash-loop hammering Wallapop and Telegram at 45-second intervals —
+    which is a good way to convert a temporary problem into a rate-limit. A
+    single successful pass resets it.
     """
     once = "--loop" not in sys.argv
+    failures = 0
     while True:
-        result = run_once()
+        try:
+            result = run_once()
+        except Exception:
+            if once:
+                raise
+            failures += 1
+            wait = min(
+                config.LOOP_INTERVAL_SECONDS * 2 ** (failures - 1),
+                LOOP_BACKOFF_CAP_SECONDS,
+            )
+            log.error(
+                "pass failed (%d consecutive) — retrying in %.0fs",
+                failures, wait, exc_info=True,
+            )
+            time.sleep(wait)
+            continue
+
+        failures = 0
         print(
             f"items={result['items_seen']} alerts={result['alerts_sent']} "
             f"junk={result['junk']} over_cap={result['over_cap']} "
