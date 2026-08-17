@@ -185,14 +185,22 @@ def run_once() -> dict:
             else:
                 active_rows.append(row)
 
-        # Observations compare against the previous listing state, so they are
-        # written before the upserts below replace it.
+        # Ordering is forced from both sides: the change comparison needs the
+        # state as it was before this pass, but observations have a foreign key
+        # to listings, so a listing must exist before its observation can be
+        # written. Hence snapshot, upsert, then observe.
         #
         # A whole machine never contributes a model_key, so its price can never
         # reach a comps pool. This is the one place form factor genuinely
         # matters: a prebuilt selling for 900 EUR is a real transaction, just
         # not one in the loose card its title names, and the reference price is
         # the number every buy ceiling is derived from.
+        prior_states = db.listing_states(list(found))
+        if reserved_rows:
+            db.upsert_listings(reserved_rows)
+        if active_rows:
+            db.upsert_listings(active_rows)
+
         stats["observations"] = db.insert_changed_observations(
             [
                 {
@@ -208,13 +216,9 @@ def run_once() -> dict:
                 }
                 for item, match in found.values()
                 if item.price is not None
-            ]
+            ],
+            prior_states,
         )
-
-        if reserved_rows:
-            db.upsert_listings(reserved_rows)
-        if active_rows:
-            db.upsert_listings(active_rows)
 
         # Only models whose searches actually ran this cycle may be judged
         # absent — otherwise a model with no comps search would have all its

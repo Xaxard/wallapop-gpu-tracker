@@ -66,6 +66,7 @@ class FakeDB:
         self.closed = {}
         self.missing_set = {}
         self.model_writes = []
+        self.calls = []
 
     # --- alert loop surface
     def start_run(self, name):
@@ -84,30 +85,46 @@ class FakeDB:
         self.junk.extend(rows)
 
     def upsert_listings(self, rows):
+        self.calls.append("upsert_listings")
         self.listings.extend(rows)
 
     def insert_observations(self, rows):
+        # observations.item_id is a FK to listings, so anything written here
+        # must already exist in listings or Postgres rejects it with 23503.
+        known = {r["item_id"] for r in self.listings}
+        for row in rows:
+            assert row["item_id"] in known, (
+                f"observation for {row['item_id']} written before its listing — "
+                "this is the foreign-key violation that crashed production"
+            )
         self.observations.extend(rows)
 
     def get_listings(self, item_ids):
         wanted = set(item_ids)
         return {r["item_id"]: r for r in self.listings if r["item_id"] in wanted}
 
-    def insert_changed_observations(self, rows):
+    def listing_states(self, item_ids):
+        self.calls.append("listing_states")
+        return {
+            k: (v.get("last_price"), v.get("last_status"))
+            for k, v in self.get_listings(item_ids).items()
+        }
+
+    def insert_changed_observations(self, rows, previous=None):
         """Mirrors Database.insert_changed_observations: only rows whose price
-        or status differs from the stored listing are kept."""
-        previous = self.get_listings([r["item_id"] for r in rows])
+        or status differs from the snapshot taken before the upsert."""
+        self.calls.append("insert_changed_observations")
+        if previous is None:
+            previous = self.listing_states([r["item_id"] for r in rows])
         fresh = []
         for row in rows:
             prior = previous.get(row["item_id"])
-            if (
-                prior is not None
-                and prior.get("last_price") == row.get("price")
-                and prior.get("last_status") == row.get("status")
-            ):
-                continue
+            if prior is not None:
+                last_price, last_status = prior
+                if last_price == row.get("price") and last_status == row.get("status"):
+                    continue
             fresh.append(row)
-        self.observations.extend(fresh)
+        self.insert_observations(fresh)
         return len(fresh)
 
     def alerted_prices(self, ids):
@@ -586,3 +603,20 @@ def test_comps_loop_sweeps_both_retention_tables(wire):
     comps_loop.run_once()
     assert db.purged, "observations retention did not run"
     assert db.junk_purged, "junk retention did not run"
+
+
+def test_listings_are_written_before_their_observations(wire):
+    """Production crash regression (PostgREST 23503). observations.item_id is a
+    foreign key to listings, so a brand-new listing must be upserted before its
+    observation. The change comparison needs the *old* state though, so the
+    order has to be: snapshot states, upsert listings, then observe."""
+    db = FakeDB([ALERT_SEARCH], PRICES)
+    wire(alert_loop, db, [make_item("fk1", "RTX 3070 Gigabyte OC", 180.0)])
+
+    alert_loop.run_once()
+
+    order = [c for c in db.calls if c in
+             ("listing_states", "upsert_listings", "insert_changed_observations")]
+    assert order.index("listing_states") < order.index("upsert_listings")
+    assert order.index("upsert_listings") < order.index("insert_changed_observations")
+    assert len(db.observations) == 1

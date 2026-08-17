@@ -142,7 +142,25 @@ class Database:
         for batch in chunked(rows):
             self.c.table("observations").insert(list(batch)).execute()
 
-    def insert_changed_observations(self, rows: list[dict]) -> int:
+    def listing_states(self, item_ids: Sequence[str]) -> dict[str, tuple]:
+        """(last_price, last_status) per listing, as it stands right now.
+
+        Read *before* upsert_listings overwrites it, and passed back into
+        insert_changed_observations afterwards. The two-step exists because the
+        ordering is forced from both sides: the comparison needs the old state,
+        but observations.item_id has a foreign key to listings, so the row has
+        to exist before its observation can be written. Writing observations
+        first crashed every production run with a 23503 the moment a listing
+        appeared that we had never seen before.
+        """
+        return {
+            item_id: (row.get("last_price"), row.get("last_status"))
+            for item_id, row in self.get_listings(item_ids).items()
+        }
+
+    def insert_changed_observations(
+        self, rows: list[dict], previous: dict[str, tuple] | None = None
+    ) -> int:
         """Record only the observations that say something new.
 
         An observation exists to capture a *change* — a price cut, or a listing
@@ -158,13 +176,14 @@ class Database:
         """
         if not rows:
             return 0
-        previous = self.get_listings([r["item_id"] for r in rows])
+        if previous is None:
+            previous = self.listing_states([r["item_id"] for r in rows])
         fresh = []
         for row in rows:
             prior = previous.get(row["item_id"])
             if prior is not None:
-                same_price = _num_eq(prior.get("last_price"), row.get("price"))
-                if same_price and prior.get("last_status") == row.get("status"):
+                last_price, last_status = prior
+                if _num_eq(last_price, row.get("price")) and last_status == row.get("status"):
                     continue
             fresh.append(row)
         self.insert_observations(fresh)

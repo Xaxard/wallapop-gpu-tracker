@@ -199,15 +199,17 @@ def run_once() -> dict:
         # Record everything we saw, reserved included — the alert loop feeds the
         # comps pool too, and its 5-minute cadence catches short-lived listings
         # the hourly comps loop would miss entirely.
-        # Observations are compared against the *previous* listing state, so
-        # they must be written before the upsert below overwrites last_price
-        # and last_status with what we just saw.
+        # Ordering here is forced from both sides: the change comparison needs
+        # the listing state as it was *before* this pass, but observations have
+        # a foreign key to listings, so a listing has to exist before its
+        # observation can be written. Hence snapshot, upsert, then observe.
         #
         # A whole machine's price is recorded but never attributed to a model:
         # a prebuilt that sells for 900 EUR is a real transaction, just not a
         # transaction in the loose card its title happens to name. Nulling the
         # model_key keeps it out of every comps pool at the source, which is
         # the only number that decides a ceiling.
+        prior_states = db.listing_states(list(found))
         observation_rows = [
             {
                 "item_id": item.item_id,
@@ -223,9 +225,10 @@ def run_once() -> dict:
             for item, match, _ in found.values()
             if item.price is not None
         ]
-        stats["observations"] = db.insert_changed_observations(observation_rows)
-
         db.upsert_listings([_listing_row(i, m) for i, m, _ in found.values()])
+        stats["observations"] = db.insert_changed_observations(
+            observation_rows, prior_states
+        )
 
         # Reserved listings price the market but you can't buy them.
         #
