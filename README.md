@@ -1,24 +1,28 @@
-# Wallapop GPU Deal-Tracker & Flip-Margin Engine
+# Wallapop Deal-Tracker & Flip-Margin Engine
 
 Watches Wallapop — across Spain, Portugal, Italy and everywhere else it
-operates, since it's one shared marketplace — for secondhand GPUs and pushes an
-instant Telegram alert whenever a listing is a genuine flip. "Genuine" means all
-of:
+operates, since it's one shared marketplace — for secondhand **GPUs and iPhones
+(15 series onwards)**, and pushes an instant Telegram alert whenever a listing
+is a genuine flip. "Genuine" means all of:
 
 - a plausible negotiated offer (asking price minus a haggle discount, default
-  20%) would net ≥ €50 after fees;
-- the asking price is at or under **€350** (`MAX_ALERT_PRICE`) — above that the
-  capital at risk stops being worth it, and it's also what keeps whole PCs and
-  gaming laptops out of the feed without having to identify them;
+  20%) would clear the required margin after fees;
+- the asking price is under the cap **for that family** — €350 for a GPU, €900
+  for a phone. One number could not do both jobs: a used iPhone 15 Pro is ~€550,
+  so the GPU cap would have muted the entire phone category rather than
+  filtered it;
+- the price isn't *implausibly* low. Under `MIN_PLAUSIBLE_RATIO` (35%) of the
+  reference it is a replica, an empty box, a spare part or bait — never a
+  bargain;
 - Wallapop's own condition field isn't the bottom tier (`has_given_it_all`).
-  Every other tier is allowed, `fair` included — a working card with a cosmetic
+  Every other tier is allowed, `fair` included — a working item with a cosmetic
   flaw is exactly the discount a flip is built on.
 
 The fair resale price is *learned* from sold + reserved comps, never from what
 active listings are asking: posting is free, so an asking price is an opinion,
 while a reservation is someone actually agreeing to pay.
 
-Runs free on GitHub Actions + Supabase, unattended, GPU-only.
+Runs free on GitHub Actions + Supabase, unattended.
 
 ```
              ┌──────────────────────────────┐
@@ -33,7 +37,7 @@ Runs free on GitHub Actions + Supabase, unattended, GPU-only.
 │ nationwide/intl  │                  │ nationwide/intl   │
 │ → classify       │                  │ → record reserved │
 │ → junk filter    │                  │ → confirm sold    │
-│ → €350 cap       │                  │ → decay-weighted  │
+│ → per-family cap │                  │ → decay-weighted  │
 │ → offer margin   │                  │   quantile        │
 │ → condition gate │                  │ → shrink to prior │
 │ → Telegram       │                  │ → buy ceiling     │
@@ -82,7 +86,7 @@ python -m venv .venv && .venv/bin/pip install -r requirements.txt
 ### 4. Verify before deploying
 
 ```bash
-.venv/bin/python -m pytest tests -q            # 220 tests, no network or DB needed
+.venv/bin/python -m pytest tests -q            # 268 tests, no network or DB needed
 .venv/bin/python smoke_test.py "rtx 4070"      # hits the live API, touches no DB
 DRY_RUN=1 .venv/bin/python alert_loop.py       # full loop, logs alerts instead of sending
 ```
@@ -130,7 +134,27 @@ buy_ceiling = ( ref_price·(1 − seller_fee) − buyer_fixed − shipping_in �
 | `SHIPPING_IN` | 4.50 | inbound shipping, boxed GPU |
 | `TARGET_MARGIN` | 50 | your minimum net profit |
 | `OFFER_DISCOUNT` | **0.20** | how far below asking you could realistically haggle a seller down |
-| `MAX_ALERT_PRICE` | **350** | hard cap on the asking price of anything that may alert |
+| `MARGIN_RATE` | **0.18** | minimum return as a fraction of the item's value |
+| `MAX_ALERT_PRICE` | **350** | cap on a GPU's asking price |
+| `MAX_ALERT_PRICE_PHONE` | **900** | cap on a phone's asking price |
+| `MIN_PLAUSIBLE_RATIO` | **0.35** | below this fraction of ref, it's fraud, not a deal |
+| `SEED_MARGIN_MULTIPLIER` | **1.6** | extra margin demanded while a price is still a guess |
+
+**The margin is the greater of `TARGET_MARGIN` and `MARGIN_RATE × ref_price.`**
+A flat €50 is 25% on a €200 card and 7% on a €700 phone — the same rule that is
+demanding on a GPU is trivially satisfied by almost every iPhone. Switching
+phones on with a flat target produced **111 alerts in a single pass**, nearly
+all of them ordinary listings. The crossover is €278, so cheap cards are
+governed by the flat floor exactly as before; above it the percentage binds,
+which does tighten the feed for mid-tier cards (a 4070 at ref €330 must now
+clear €59 rather than €50). `MARGIN_RATE=0` restores the old behaviour.
+
+**A seeded price demands 1.6× that margin.** A seed is an educated guess, and
+the feed is only as good as the guess: one that is 25% too high makes every
+ordinary listing look like a bargain. Demanding more while confidence is low,
+and relaxing automatically once `MIN_COMPS` real comps exist, is the honest way
+to express that. Together these took the first live phone pass from 116 alerts
+to 25.
 
 The gate checks a **negotiated offer**, not the raw asking price: a listing
 qualifies if `asking · (1 − OFFER_DISCOUNT)` would clear `buy_ceiling`, even
@@ -168,6 +192,27 @@ select category, phrase, count(*) from junk_exclusions group by 1,2 order by 3 d
 - **NOT_A_CARD** — `waterblock`, `backplate`, `soporte grafica`, …
 - **BUNDLE** — `pc gaming`, `pc gamer`, `ordenador gaming`, …
 - **LAPTOP** — `legion`, `portatil`, `proart p16`/`px13`, `aorus 17`, `tuf a15`, mobile CPU suffixes, …
+Phone-only categories, every one of them gated on the title naming an Apple
+product so none of it can ever touch a graphics card — `pantalla` and `cable`
+are ordinary words in a GPU listing and fatal ones in a phone title:
+
+- **ACCESSORY** / **PART** — `funda`, `protector`, `caja`, `cargador`,
+  `pantalla`, `bateria`, … Matched when the word appears **before** the phone
+  name, which is what separates the product from things sold *for* it. Every
+  junk listing names the accessory first and the handset second, because the
+  handset is the qualifier ("Pack Fundas iPhone 15 Pro Max", "Caja iPhone 15
+  Pro Max"); every genuine one does the reverse, whatever precedes it ("Vendo
+  mi iPhone 15 Pro con funda y cargador"). A leading-token check missed all of
+  them, because brand names, quantities and stars get there first.
+- **LOCKED** — `icloud`, `imei bloqueado`, `lista negra`, … The one phone rule
+  that fires anywhere in the text, because it is a hard defect: a locked handset
+  cannot be activated by anyone, so it is not a cheap phone, it is not a phone.
+- **FAKE** — `replica`, `clon`, `copia`, … A replica at €150 against a €700
+  reference looks like the best deal of the day.
+- **SERVICE** — `cambio bateria`, `reparacion`, … Repair shops advertising at
+  the price of the repair. "Cambio Batería iPhone 17e - 69€" reads as a €69
+  iPhone 17e, and these dominated the first live phone run.
+
 - **CPU** — `procesador`, `microprocesador` — catches AMD Ryzen listings whose
   model number numerically collides with a Radeon GPU's (Ryzen 5 "7600" vs
   Radeon RX "7600", both bare numbers with no differentiating suffix). This one
@@ -279,6 +324,11 @@ from model_prices order by is_seed, n_comps desc;
 |---|---|
 | Change how much you'd haggle | `OFFER_DISCOUNT` in `.env` (default 0.20) |
 | Spend more (or less) per card | `MAX_ALERT_PRICE` (default 350) |
+| Spend more (or less) per phone | `MAX_ALERT_PRICE_PHONE` (default 900) |
+| Demand a bigger % return | `MARGIN_RATE` (default 0.18); set 0 for a flat target only |
+| Quieten a noisy new category | raise `SEED_MARGIN_MULTIPLIER` (default 1.6) |
+| Accept riskier bargains | lower `MIN_PLAUSIBLE_RATIO` (default 0.35) |
+| Track a different iPhone range | edit `models._IPHONES` and `seed.IPHONE_MODELS` |
 | Ignore cheap junk/scam listings | `MIN_SANE_PRICE` (default 50 — a real GPU below that is never genuine) |
 | Also block worn cards | add `fair` to `BLOCKED_CONDITIONS` (default blocks only `has_given_it_all`) |
 | Favour cards that sell fast | lower `REF_PERCENTILE` to ~0.35 — prices in selling quickly rather than eventually |

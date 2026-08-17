@@ -375,6 +375,13 @@ class Deal:
         return self.ref_price is not None
 
 
+def _seeded_ceiling(fees: "config.FeeModel", ref: float) -> float:
+    """Buy ceiling with the seed-confidence penalty applied."""
+    required = fees.required_margin(ref) * config.SEED_MARGIN_MULTIPLIER
+    gross = ref * (1 - fees.seller_fee)
+    return (gross - fees.buyer_fixed - fees.shipping_in - required) / (1 + fees.buyer_fee)
+
+
 def evaluate(price: float, model_row: dict | None, bootstrap_cap: float | None) -> Deal:
     """Decide whether a listing clears the margin gate.
 
@@ -390,10 +397,35 @@ def evaluate(price: float, model_row: dict | None, bootstrap_cap: float | None) 
 
     if model_row and model_row.get("ref_price"):
         ref = float(model_row["ref_price"])
-        ceiling = model_row.get("buy_ceiling")
-        ceiling = float(ceiling) if ceiling is not None else config.SHIPPED.buy_ceiling(ref)
-        ceiling_ip = model_row.get("buy_ceiling_in_person")
-        ceiling_ip = float(ceiling_ip) if ceiling_ip is not None else config.IN_PERSON.buy_ceiling(ref)
+
+        # Too cheap to be true. The margin engine is structurally blind to this
+        # on its own: the more absurd the price, the better the margin it
+        # computes, so fakes and mispriced spare parts sort straight to the top
+        # of the feed. Anything under MIN_PLAUSIBLE_RATIO of the reference is a
+        # replica, an empty box, a part, a repair service or outright bait.
+        if price < ref * config.MIN_PLAUSIBLE_RATIO:
+            return Deal(
+                False,
+                f"implausibly cheap ({price:.0f} vs ref {ref:.0f})",
+                ref_price=ref,
+            )
+
+        is_seed = bool(model_row.get("is_seed"))
+        if is_seed:
+            # Recomputed rather than read from the row: a seeded ceiling is
+            # only as good as the guess behind it, so it has to clear a higher
+            # bar until real comps replace it. This relaxes on its own the
+            # moment the model reaches MIN_COMPS.
+            ceiling = _seeded_ceiling(config.SHIPPED, ref)
+            ceiling_ip = _seeded_ceiling(config.IN_PERSON, ref)
+        else:
+            ceiling = model_row.get("buy_ceiling")
+            ceiling = float(ceiling) if ceiling is not None else config.SHIPPED.buy_ceiling(ref)
+            ceiling_ip = model_row.get("buy_ceiling_in_person")
+            ceiling_ip = (
+                float(ceiling_ip) if ceiling_ip is not None
+                else config.IN_PERSON.buy_ceiling(ref)
+            )
 
         offer_price = round(price * (1 - config.OFFER_DISCOUNT), 2)
         qualifies = offer_price <= ceiling
@@ -407,7 +439,7 @@ def evaluate(price: float, model_row: dict | None, bootstrap_cap: float | None) 
             net_shipped=config.SHIPPED.net_margin(offer_price, ref),
             net_in_person=config.IN_PERSON.net_margin(offer_price, ref),
             net_shipped_at_asking=config.SHIPPED.net_margin(price, ref),
-            is_seed=bool(model_row.get("is_seed")),
+            is_seed=is_seed,
             n_comps=int(model_row.get("n_comps") or 0),
             median_days_to_sale=(
                 float(model_row["median_days_to_sale"])

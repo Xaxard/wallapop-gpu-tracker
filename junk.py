@@ -117,6 +117,69 @@ LAPTOP_PHRASES = (
 # "microprocesador" only ever show up when the product itself is a CPU.
 CPU_TOKENS = ("procesador", "microprocesador")
 
+# ----------------------------------------------------------------- phones
+# Everything below only fires on a listing that names an Apple phone, so none
+# of it can touch a GPU listing. "pantalla" in particular is a normal word in a
+# graphics-card description ("no da imagen en pantalla") and a fatal one in a
+# phone title, where it means a replacement screen rather than a handset.
+
+APPLE_TOKENS = ("iphone", "apple")
+
+# The product is an accessory that merely names the phone it fits. Matched only
+# when one of these *leads* the title — "iPhone 15 Pro con funda y cargador" is
+# a phone being sold with extras, while "Funda Silicona iPhone 15 Pro Max" is a
+# 23 EUR case that would otherwise classify as a 700 EUR handset.
+PHONE_ACCESSORY_LEADS = (
+    "funda", "fundas", "carcasa", "carcasas", "protector", "protectores",
+    "cristal", "cristales", "templado", "cargador", "cargadores", "cable",
+    "cables", "adaptador", "soporte", "correa", "powerbank", "airpods",
+    "airtag", "dock", "auriculares", "caja", "cajas", "filtro", "filtros",
+    "kit", "pack", "lote", "anillo", "grip", "tripode", "estuche",
+)
+
+# Spare parts. Same rule, same reason.
+PHONE_PART_LEADS = (
+    "pantalla", "pantallas", "display", "placa", "tapa", "modulo", "flex",
+    "altavoz", "chasis", "camara", "lente", "bateria", "baterias", "conector",
+    "boton", "vibrador", "antena",
+)
+
+# Counterfeits. A replica is not a cheap iPhone, it is a different product, and
+# at 150 EUR against a 700 EUR reference it looks like the best deal of the day.
+PHONE_FAKE = (
+    "replica", "replicas", "clon", "clonico", "copia", "imitacion",
+    "no original", "tipo iphone", "estilo iphone", "similar al iphone",
+)
+
+# Repair shops advertising a service, priced at the cost of the repair. "Cambio
+# Batería iPhone 17e - 69€" reads as a 69 EUR iPhone 17e against a 580 EUR
+# reference, which is why these dominated the first live run of phone alerts.
+PHONE_SERVICE = (
+    "cambio de bateria", "cambio bateria", "cambio de pantalla", "cambio pantalla",
+    "reparacion", "reparaciones", "reparamos", "reparo", "arreglo", "arreglamos",
+    "servicio tecnico", "cambiamos", "presupuesto sin compromiso", "mano de obra",
+)
+
+# Locked or blocked handsets. This is the one phone rule that fires anywhere in
+# the text rather than only at the start, because it is a hard defect: an
+# iCloud-locked or IMEI-blacklisted phone cannot be activated by anyone, so it
+# is not a cheap phone, it is not a phone at all. Consistent with the rule that
+# a card which still works is fine — these do not work.
+PHONE_LOCKED = (
+    "icloud",
+    "bloqueado por icloud",
+    "bloqueo de activacion",
+    "cuenta de icloud",
+    "buscar mi iphone activado",
+    "imei bloqueado",
+    "lista negra",
+    "blacklist",
+    "reportado como perdido",
+    "no se puede activar",
+    "pide cuenta",
+    "solo para piezas",
+)
+
 # Patterns are matched against the *normalised* title, where normalise() has
 # already split letter/digit runs ("i7 14650HX" -> "i 7 14650 hx").
 LAPTOP_REGEXES = (
@@ -187,6 +250,9 @@ _PHRASE_GROUPS_RX = tuple(
 )
 _BUNDLE_RX = _compile(BUNDLE)
 _LAPTOP_PHRASES_RX = _compile(LAPTOP_PHRASES)
+_PHONE_LOCKED_RX = _compile(PHONE_LOCKED)
+_PHONE_FAKE_RX = _compile(PHONE_FAKE)
+_PHONE_SERVICE_RX = _compile(PHONE_SERVICE)
 
 
 def _first_hit(
@@ -214,9 +280,87 @@ def _leads_with_card_noun(norm_title: str) -> bool:
     return any(head.startswith(noun) for noun in CARD_NOUNS)
 
 
+def _mentions_apple(norm_text: str) -> bool:
+    return any(re.search(rf"\b{t}\b", norm_text) for t in APPLE_TOKENS)
+
+
+def _first_index(tokens: list[str], words: tuple[str, ...]) -> tuple[int, str | None]:
+    """Position of the earliest listed word, and which one it was."""
+    best, hit = len(tokens), None
+    for i, token in enumerate(tokens):
+        if token in words and i < best:
+            best, hit = i, token
+    return best, hit
+
+
+def _accessory_before_product(norm_title: str, words: tuple[str, ...]) -> str | None:
+    """The accessory/part word, when it is named *before* the phone itself.
+
+    Word order is what separates the product from things sold for it, and it is
+    far more reliable than checking only the first token. Every junk listing
+    names the accessory first and the handset second, because the handset is
+    the qualifier: "Funda Silicona iPhone 15 Pro", "Pack Fundas iPhone 15 Pro
+    Max", "Ringke Funda Magnética para iPhone 15 Plus", "3 Protectores Pantalla
+    Cristal Templado iPhone 16", "Caja iPhone 15 Pro Max". Every genuine
+    listing does the reverse, whatever precedes it: "iPhone 15 Pro con funda",
+    "Vendo mi iPhone 15 Pro con funda y cargador".
+
+    A leading-token check missed all five junk examples above, because brand
+    names, quantities and stars get there first.
+    """
+    tokens = norm_title.split()
+    phone_at, _ = _first_index(tokens, APPLE_TOKENS)
+    word_at, word = _first_index(tokens, words)
+    return word if word is not None and word_at < phone_at else None
+
+
+def _phone_verdict(norm_title: str, haystack: str) -> JunkVerdict | None:
+    """Phone-only rules. Returns None when nothing applies.
+
+    Gated on the listing naming an Apple phone at all, so a graphics card whose
+    description happens to say "pantalla" or "cable" is never touched by any of
+    this.
+    """
+    if not _mentions_apple(haystack):
+        return None
+
+    hit = _first_hit(haystack, _PHONE_LOCKED_RX)
+    if hit:
+        return JunkVerdict(True, hit, "LOCKED")
+
+    hit = _first_hit(haystack, _PHONE_FAKE_RX)
+    if hit:
+        return JunkVerdict(True, hit, "FAKE")
+
+    # Services are advertised in the title; a genuine seller's description may
+    # well mention having had the battery changed, which is a selling point.
+    hit = _first_hit(norm_title, _PHONE_SERVICE_RX)
+    if hit:
+        return JunkVerdict(True, hit, "SERVICE")
+
+    word = _accessory_before_product(norm_title, PHONE_ACCESSORY_LEADS)
+    if word:
+        return JunkVerdict(True, word, "ACCESSORY")
+    word = _accessory_before_product(norm_title, PHONE_PART_LEADS)
+    if word:
+        return JunkVerdict(True, word, "PART")
+    return None
+
+
 def check(title: str | None, description: str | None = None) -> JunkVerdict:
     """Return why a listing should be dropped, or CLEAN."""
     norm_title = normalise(title)
+    norm_desc = normalise(description) if description else ""
+    haystack = f"{norm_title} {norm_desc}".strip()
+
+    # Phones first, and they take the whole decision: an Apple listing must not
+    # then be run through the GPU form-factor lists, whose bare tokens were
+    # chosen on the assumption that every listing is a graphics card.
+    if _mentions_apple(norm_title):
+        verdict = _phone_verdict(norm_title, haystack)
+        if verdict is not None:
+            return verdict
+        return _shared_rules(norm_title, haystack)
 
     # Form-factor checks run on the title only and are skipped when the title
     # opens by naming a card, so "Gráfica RTX 4070 sacada de un portátil" stays.
@@ -240,6 +384,15 @@ def check(title: str | None, description: str | None = None) -> JunkVerdict:
             if hit:
                 return JunkVerdict(True, hit.group(0), "LAPTOP")
 
+    return _shared_rules(norm_title, haystack)
+
+
+def _shared_rules(norm_title: str, haystack: str) -> JunkVerdict:
+    """Rules that hold whatever the product is: wanted ads, LEER, defects.
+
+    A broken phone and a broken card are both worthless for the same reason, and
+    "busco" opens a wanted ad in either category.
+    """
     for prefix in WANTED_PREFIXES:
         if norm_title.startswith(prefix + " ") or norm_title == prefix:
             return JunkVerdict(True, prefix, "WANTED")
@@ -247,10 +400,6 @@ def check(title: str | None, description: str | None = None) -> JunkVerdict:
     leer_hit = LEER_RX.search(norm_title)
     if leer_hit:
         return JunkVerdict(True, leer_hit.group(0), "LEER")
-
-    haystack = norm_title
-    if description:
-        haystack = f"{norm_title} {normalise(description)}"
 
     for category, compiled in _PHRASE_GROUPS_RX:
         hit = _first_hit(haystack, compiled)

@@ -51,21 +51,41 @@ def _sold_row(item_id, price, age_days=0.0):
 
 
 # ------------------------------------------------------------------ margins
-def test_shipped_ceiling_matches_worked_example():
-    """Spec §5.3: a 4070 at ref 330 must be <= ~224 shipped."""
+def test_flat_floor_governs_cheap_items(monkeypatch):
+    """Below the TARGET_MARGIN / MARGIN_RATE crossover (~278 EUR at the
+    defaults) the flat 50 EUR floor still decides, exactly as it always did."""
     fees = config.FeeModel(0.10, 0.075, 0.69, 4.50, 50.0, "shipped")
-    assert fees.buy_ceiling(330) == pytest.approx(224.0, abs=1.0)
+    assert fees.required_margin(200) == pytest.approx(50.0)
+    assert fees.buy_ceiling(200) == pytest.approx((200 * 0.9 - 0.69 - 4.5 - 50) / 1.075)
 
 
-def test_in_person_ceiling_is_ref_minus_target():
+def test_rate_governs_expensive_items():
+    """50 EUR on a 620 EUR card is an 8% return for the same work and risk as a
+    25% one on a 200 EUR card, so above the crossover the percentage binds."""
+    fees = config.FeeModel(0.10, 0.075, 0.69, 4.50, 50.0, "shipped")
+    assert fees.required_margin(620) == pytest.approx(0.18 * 620)
+    assert fees.required_margin(330) == pytest.approx(59.4)
+
+
+def test_in_person_ceiling_is_ref_minus_required_margin():
     fees = config.FeeModel(0.0, 0.0, 0.0, 0.0, 50.0, "in person")
-    assert fees.buy_ceiling(330) == pytest.approx(280.0)
+    assert fees.buy_ceiling(200) == pytest.approx(150.0)          # flat floor
+    assert fees.buy_ceiling(330) == pytest.approx(330 - 59.4)     # rate binds
 
 
-def test_buying_at_the_ceiling_nets_exactly_the_target():
+def test_buying_at_the_ceiling_nets_exactly_the_required_margin():
     fees = config.FeeModel(0.10, 0.075, 0.69, 4.50, 50.0, "shipped")
-    ceiling = fees.buy_ceiling(330)
-    assert fees.net_margin(ceiling, 330) == pytest.approx(50.0)
+    for ref in (200, 330, 620):
+        ceiling = fees.buy_ceiling(ref)
+        assert fees.net_margin(ceiling, ref) == pytest.approx(fees.required_margin(ref))
+
+
+def test_margin_rate_can_be_disabled(monkeypatch):
+    """MARGIN_RATE=0 restores the old flat-only behaviour verbatim."""
+    monkeypatch.setattr(config, "MARGIN_RATE", 0.0)
+    fees = config.FeeModel(0.10, 0.075, 0.69, 4.50, 50.0, "shipped")
+    assert fees.required_margin(620) == pytest.approx(50.0)
+    assert fees.buy_ceiling(330) == pytest.approx(224.0, abs=1.0)
 
 
 # -------------------------------------------------------------------- comps
@@ -638,3 +658,48 @@ def test_bare_ryzen_mention_does_not_exclude():
 def test_card_mentioning_a_compatible_cpu_survives():
     verdict = junk.check("Tarjeta grafica RTX 4070 ideal para Ryzen 5000")
     assert not verdict.excluded, f"wrongly excluded on {verdict.phrase!r}"
+
+
+# ------------------------------------------------ seed-confidence penalty
+def _row(ref, is_seed):
+    return {
+        "ref_price": ref,
+        "buy_ceiling": config.SHIPPED.buy_ceiling(ref),
+        "buy_ceiling_in_person": config.IN_PERSON.buy_ceiling(ref),
+        "is_seed": is_seed,
+        "n_comps": 0 if is_seed else 12,
+    }
+
+
+def test_seeded_models_demand_more_margin_than_learned_ones():
+    """A seed price is a guess, and the whole feed is only as good as it: a seed
+    25% too high makes every ordinary listing look like a bargain. So confidence
+    buys leniency — and this relaxes by itself once real comps arrive."""
+    ref = 560.0
+    # 500 sits between the two ceilings: an offer of 400 clears the learned
+    # ceiling (~422) but not the seeded one (~366).
+    learned = pricing.evaluate(500.0, _row(ref, is_seed=False), None)
+    seeded = pricing.evaluate(500.0, _row(ref, is_seed=True), None)
+    assert learned.qualifies
+    assert not seeded.qualifies
+    assert seeded.ceiling_shipped < learned.ceiling_shipped
+
+
+def test_a_genuine_bargain_still_gets_through_a_seed_price():
+    """The penalty raises the bar, it does not close the door — otherwise a
+    brand-new model could never produce its first alert."""
+    seeded = pricing.evaluate(300.0, _row(560.0, is_seed=True), None)
+    assert seeded.qualifies
+
+
+def test_seed_penalty_can_be_disabled(monkeypatch):
+    monkeypatch.setattr(config, "SEED_MARGIN_MULTIPLIER", 1.0)
+    assert pricing.evaluate(500.0, _row(560.0, is_seed=True), None).qualifies
+
+
+def test_implausibly_cheap_is_rejected_whatever_the_margin_says():
+    """The margin engine is structurally blind here: the more absurd the price,
+    the better the margin it computes, so fakes sort to the top of the feed."""
+    deal = pricing.evaluate(150.0, _row(700.0, is_seed=False), None)
+    assert not deal.qualifies
+    assert "implausibly cheap" in deal.reason

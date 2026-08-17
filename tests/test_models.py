@@ -150,3 +150,81 @@ def test_generic_card_words_still_vouch_for_either_vendor():
     proof for both sides."""
     assert models.classify("Tarjeta grafica 4070 12GB").priceable
     assert models.classify("Tarjeta grafica 7600 8GB").priceable
+
+
+# ------------------------------------------------------------------- iPhones
+@pytest.mark.parametrize(
+    "title,key",
+    [
+        ("iPhone 15 Pro Max 256GB Titanio Negro", "iphone_15_pro_max"),
+        ("IPHONE 15 PRO MAX", "iphone_15_pro_max"),
+        ("iPhone 15 Pro 128GB Azul Titanio", "iphone_15_pro"),
+        ("iPhone 15 Plus 512 GB", "iphone_15_plus"),
+        ("iPhone 15 128GB", "iphone_15"),
+        ("iPhone 16e 128GB", "iphone_16e"),
+        ("iPhone 16 promax 256gb", "iphone_16_pro_max"),
+        ("iPhone 17 Pro 256GB Azul Marino", "iphone_17_pro"),
+        ("iPhone 17e", "iphone_17e"),
+        ("iPhone15 Pro Max 1TB", "iphone_15_pro_max"),
+        ("Apple 15 Pro Max", "iphone_15_pro_max"),
+    ],
+)
+def test_iphone_variants_classify(title, key):
+    assert models.classify(title).model_key == key
+
+
+def test_pro_max_is_never_read_as_the_base_model():
+    """Registry order is load-bearing: a 15 Pro Max that fell through to
+    `iphone_15` would price a ~620 EUR phone against a ~438 EUR one."""
+    for gen in ("15", "16", "17"):
+        m = models.classify(f"iPhone {gen} Pro Max 256GB")
+        assert m.model_key == f"iphone_{gen}_pro_max", gen
+
+
+def test_iphone_air_outranks_its_generation():
+    """Sellers write "iPhone 17 Air", so the Air entry must be tried before the
+    bare 17 — caught in testing, where it classified as iphone_17."""
+    assert models.classify("iPhone 17 Air 512GB").model_key == "iphone_air"
+    assert models.classify("iPhone Air").model_key == "iphone_air"
+    assert models.classify("iPhone 17 256GB").model_key == "iphone_17"
+
+
+def test_iphone_patterns_require_the_brand_token():
+    """A bare number is far too loose for phones: `\\b15\\b` alone would swallow
+    "Cargador 15W" and any GPU listing quoting a quantity."""
+    assert models.classify("Cargador 15W USB-C").model_key is None
+    assert models.classify("RTX 4070 15 unidades disponibles").model_key == "rtx_4070"
+
+
+def test_iphones_older_than_15_are_out_of_scope():
+    assert models.classify("iPhone 14 Pro Max 256GB").model_key is None
+    assert models.classify("iPhone 13").model_key is None
+
+
+@pytest.mark.parametrize(
+    "title,storage",
+    [
+        ("iPhone 15 Pro 128GB", "128gb"),
+        ("iPhone 15 Pro 256 GB", "256gb"),
+        ("iPhone 15 Pro Max 512GB", "512gb"),
+        ("iPhone 15 Pro Max 1TB", "1tb"),
+        ("iPhone 15 Pro Max", None),
+    ],
+)
+def test_storage_is_extracted(title, storage):
+    assert models.classify(title).storage == storage
+
+
+def test_storage_takes_the_smallest_figure():
+    """Opposite of VRAM. Phone titles cross-sell extras ("+ tarjeta 512GB de
+    regalo"), and over-reading storage inflates the reference price."""
+    m = models.classify("iPhone 15 128GB + funda y tarjeta 512GB de regalo")
+    assert m.storage == "128gb"
+
+
+def test_family_is_tagged_on_every_match():
+    assert models.classify("iPhone 15 Pro").family == "phone"
+    assert models.classify("RTX 4070 Gigabyte").family == "gpu"
+    assert models.family_of("iphone_15_pro") == "phone"
+    assert models.family_of("rtx_4070") == "gpu"
+    assert models.family_of(None) is None

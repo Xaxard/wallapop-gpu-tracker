@@ -58,6 +58,12 @@ class Item:
     country: str | None = None
     condition: str | None = None
     brand: str | None = None
+    # Phones only. Wallapop asks the seller for these directly, so they are far
+    # more reliable than the title — though not universally filled, and some
+    # sellers type a bare "15 Pro" into the model field, so the title parser
+    # stays the primary source and these confirm it.
+    api_model: str | None = None
+    storage: str | None = None
     taxonomy: tuple[int, ...] = ()
     posted_at: datetime | None = None
     modified_at: datetime | None = None
@@ -201,6 +207,19 @@ def _flag(raw: dict, *paths: str) -> bool:
     return False
 
 
+def _storage(raw: dict) -> str | None:
+    """Phone storage tier, normalised to match models.extract_storage().
+
+    The API returns "256gb" already lowercased, but sellers on older listings
+    produced "256 GB" and "1 TB", so it is squashed rather than trusted.
+    """
+    value = _first(raw, "type_attributes.storage_capacity.value")
+    if not isinstance(value, str):
+        return None
+    squashed = value.lower().replace(" ", "")
+    return squashed or None
+
+
 def _reserved(raw: dict) -> bool:
     return _flag(raw, "reserved.flag", "reserved", "flags.reserved", "is_reserved")
 
@@ -336,6 +355,8 @@ def parse_item(raw: dict) -> Item | None:
         # /search doesn't return them, so this is None on search results.
         condition=_first(raw, "type_attributes.condition.value"),
         brand=_first(raw, "type_attributes.brand.value"),
+        api_model=_first(raw, "type_attributes.model.value"),
+        storage=_storage(raw),
         taxonomy=_taxonomy(raw),
         posted_at=_epoch_ms(raw, "created_at"),
         modified_at=_epoch_ms(raw, "modified_at"),

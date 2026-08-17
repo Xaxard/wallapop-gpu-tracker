@@ -48,6 +48,8 @@ def _listing_row(item: Item, match: models.Match) -> dict:
         "whole_machine": item.whole_machine,
         "posted_at": iso(item.posted_at) if item.posted_at else None,
         "user_allows_shipping": item.user_allows_shipping,
+        "family": match.family,
+        "storage": match.storage or item.storage,
     }
 
 
@@ -62,10 +64,12 @@ def _relevant(search: dict, match: models.Match) -> bool:
     model_key = search.get("model_key")
     if model_key:
         return models.same_family(model_key, match.model_key)
-    if search.get("category_ids") == config.CATEGORY_GPU:
-        # Broad discovery searches: must at least be an identifiable card.
+    if search.get("category_ids"):
+        # Broad discovery searches: must at least be an identifiable product.
+        # Any category, not just the GPU one — phone discovery has exactly the
+        # same problem, and "iphone" as a keyword returns cases and chargers.
         return match.model_key is not None
-    # Non-GPU keyword watches (google pixel) stay plain keyword matches.
+    # Bare keyword watches with no category stay plain keyword matches.
     return True
 
 
@@ -85,7 +89,7 @@ def _enrich(wp: WallapopClient, item: Item) -> Item:
         return item
     if detail is None:
         return item
-    for field in ("condition", "brand", "user_allows_shipping"):
+    for field in ("condition", "brand", "user_allows_shipping", "api_model", "storage"):
         value = getattr(detail, field, None)
         if value is not None:
             setattr(item, field, value)
@@ -231,22 +235,27 @@ def run_once() -> dict:
         # laptops in the alert path at all — a machine with a card in it is
         # essentially never listed this cheap, so the cap filters them out on
         # price without ever having to guess at form factor from a title.
+        def _under_cap(item: Item, match: models.Match) -> bool:
+            # The cap is per family: a used iPhone 15 Pro sits near 550 EUR, so
+            # the GPU ceiling would mute the entire phone category rather than
+            # filter it.
+            return float(item.price) <= config.max_alert_price(match.family)
+
         candidates = {
             iid: v
             for iid, v in found.items()
-            if not v[0].reserved
-            and v[0].price is not None
-            and float(v[0].price) <= config.MAX_ALERT_PRICE
+            if not v[0].reserved and v[0].price is not None and _under_cap(v[0], v[1])
         }
         over_cap = sum(
             1
-            for _, v in found.items()
-            if v[0].price is not None and float(v[0].price) > config.MAX_ALERT_PRICE
+            for v in found.values()
+            if v[0].price is not None and not _under_cap(v[0], v[1])
         )
         stats["over_cap"] = over_cap
         log.info(
-            "%d candidates under %.0f EUR (%d listings priced above the cap)",
-            len(candidates), config.MAX_ALERT_PRICE, over_cap,
+            "%d candidates within the per-family cap (gpu %.0f / phone %.0f); "
+            "%d listings priced above it",
+            len(candidates), config.MAX_ALERT_PRICE, config.MAX_ALERT_PRICE_PHONE, over_cap,
         )
         already = db.alerted_prices(list(candidates))
         detail_client = WallapopClient()

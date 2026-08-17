@@ -56,8 +56,14 @@ BRAND_TOKENS = (
 # reports a 143 EUR margin on a twenty-year-old card.
 AMD_TOKENS = ("rx", "radeon", "amd")
 NVIDIA_TOKENS = ("rtx", "gtx", "nvidia", "geforce")
+APPLE_TOKENS = ("iphone", "apple")
 
 VRAM_RE = re.compile(r"\b(4|6|8|10|11|12|16|20|24|32)\s*(?:gb|g|gigas?)\b")
+
+# Phone storage. 1TB is written every possible way, so it normalises to "1tb".
+# Deliberately excludes the small sizes a modern iPhone never ships with —
+# "64 gb" in an iPhone 15 title is almost always an unrelated number.
+STORAGE_RE = re.compile(r"\b(128|256|512)\s*gb\b|\b(1)\s*(?:tb|t)\b")
 
 
 @dataclass(frozen=True)
@@ -67,6 +73,9 @@ class ModelDef:
     pattern: str
     # When set, the match only counts if the title's VRAM equals this value.
     vram: int | None = None
+    # Which product family this is. Drives the price cap, the brand-consistency
+    # check, and which junk rules are allowed to fire.
+    family: str = "gpu"
 
 
 def _num(n: str, *suffix: str) -> str:
@@ -79,6 +88,69 @@ def _num(n: str, *suffix: str) -> str:
     for s in suffix:
         parts.append(rf"\s+{s}")
     return "".join(parts) + r"\b"
+
+
+def _iphone(*parts: str) -> str:
+    """Pattern for an iPhone model name.
+
+    The brand token is *required*, unlike the GPU patterns. A GPU number like
+    "4070" is distinctive enough to stand alone, but "15" is not — a bare
+    `\\b15\\b` would classify "Cargador 15W" and "RTX 4070 15 unidades" as
+    iPhones. Apple is also accepted because a few sellers write "Apple 15 Pro".
+
+    normalise() splits letter/digit runs, so "iPhone15" and "16e" arrive as
+    "iphone 15" and "16 e"; "promax" has no digit boundary to split on, so both
+    spellings are matched explicitly.
+    """
+    body = r"\s+".join(parts)
+    return rf"\b(?:iphone|apple)\s+{body}\b"
+
+
+_PRO_MAX = r"(?:pro\s+max|promax)"
+
+# Generated rather than written out: 13 near-identical entries in strict
+# most-specific-first order is exactly the kind of list where a hand-typed
+# ordering slip silently mis-prices a whole generation.
+def _generation(num: str, *, variants: tuple[str, ...]) -> tuple[ModelDef, ...]:
+    out: list[ModelDef] = []
+    for suffix, label, pattern in variants:
+        key = f"iphone_{num}" + (f"_{suffix}" if suffix else "")
+        display = f"iPhone {num}" + (f" {label}" if label else "")
+        out.append(ModelDef(key, display, _iphone(num, pattern) if pattern else _iphone(num),
+                            family="phone"))
+    return tuple(out)
+
+
+_GEN_15_16 = (
+    ("pro_max", "Pro Max", _PRO_MAX),
+    ("pro", "Pro", "pro"),
+    ("plus", "Plus", "plus"),
+    ("", "", ""),
+)
+# The Plus was retired after the 16; the 17 line replaces it with the Air.
+_GEN_17 = (
+    ("pro_max", "Pro Max", _PRO_MAX),
+    ("pro", "Pro", "pro"),
+    ("", "", ""),
+)
+
+_IPHONES: tuple[ModelDef, ...] = (
+    # 17 series (Sept 2025) + iPhone 17e (Mar 2026)
+    ModelDef("iphone_17e", "iPhone 17e", _iphone("17", "e"), family="phone"),
+    # Apple's own name is just "iPhone Air", but sellers routinely slot it into
+    # the generation they think of it as ("iPhone 17 Air"), so both parse. It
+    # has to sit *above* the 17 generation for the same reason "pro max" sits
+    # above "pro": otherwise "iPhone 17 Air" matches the bare 17 first and
+    # prices a ~800 EUR phone against a ~700 EUR one.
+    ModelDef("iphone_air", "iPhone Air", r"\b(?:iphone|apple)\s+(?:17\s+)?air\b",
+             family="phone"),
+    *_generation("17", variants=_GEN_17),
+    # 16 series (Sept 2024) + iPhone 16e (Feb 2025)
+    ModelDef("iphone_16e", "iPhone 16e", _iphone("16", "e"), family="phone"),
+    *_generation("16", variants=_GEN_15_16),
+    # 15 series (Sept 2023)
+    *_generation("15", variants=_GEN_15_16),
+)
 
 
 # Ordered most-specific first. First match wins.
@@ -138,6 +210,11 @@ REGISTRY: tuple[ModelDef, ...] = (
     ModelDef("rx_6650_xt", "RX 6650 XT", _num("6650", "xt")),
     ModelDef("rx_6600_xt", "RX 6600 XT", _num("6600", "xt")),
     ModelDef("rx_6600", "RX 6600", _num("6600")),
+    # ----------------------------------------------------------------- iPhones
+    # 15 series onwards. Ordered most-specific first within each generation:
+    # "pro max" must be tried before "pro", and "pro" before the bare number,
+    # or an iPhone 15 Pro Max classifies as an iPhone 15 and prices ~270 EUR low.
+    *_IPHONES,
 )
 
 _COMPILED = tuple((m, re.compile(m.pattern)) for m in REGISTRY)
@@ -183,6 +260,8 @@ class Match:
     display: str | None
     confidence: str  # 'high' | 'medium' | 'low' | 'none'
     vram: int | None = None
+    family: str | None = None
+    storage: str | None = None   # phones: '128gb' | '256gb' | '512gb' | '1tb'
 
     @property
     def priceable(self) -> bool:
@@ -191,6 +270,13 @@ class Match:
 
 
 NO_MATCH = Match(None, None, "none")
+
+FAMILY_BY_KEY = {m.key: m.family for m in REGISTRY}
+
+
+def family_of(model_key: str | None) -> str | None:
+    """Family for a stored model_key, for callers that only kept the key."""
+    return FAMILY_BY_KEY.get(model_key or "")
 
 
 def extract_vram(norm_text: str) -> int | None:
@@ -203,6 +289,21 @@ def extract_vram(norm_text: str) -> int | None:
     """
     hits = [int(m.group(1)) for m in VRAM_RE.finditer(norm_text)]
     return max(hits) if hits else None
+
+
+def extract_storage(norm_text: str) -> str | None:
+    """Phone storage tier, normalised to '128gb' / '256gb' / '512gb' / '1tb'.
+
+    Smallest wins, the opposite of extract_vram. Phone titles quote the
+    storage they are selling, but bundle-ish listings and accessory cross-sells
+    add larger numbers ("iPhone 15 128GB + funda, tarjeta 512GB de regalo"), and
+    over-reading storage inflates the reference price rather than deflating it.
+    """
+    order = {"128gb": 0, "256gb": 1, "512gb": 2, "1tb": 3}
+    hits: list[str] = []
+    for m in STORAGE_RE.finditer(norm_text):
+        hits.append("1tb" if m.group(2) else f"{m.group(1)}gb")
+    return min(hits, key=lambda h: order[h]) if hits else None
 
 
 def _has_token(norm_text: str, tokens: tuple[str, ...]) -> bool:
@@ -222,6 +323,12 @@ def _confidence(norm_text: str, has_vram_proof: bool, key: str) -> str:
     still matched, and a listing can legitimately name both vendors ("cambio mi
     RX 7600 por una Nvidia").
     """
+    if FAMILY_BY_KEY.get(key) == "phone":
+        # The pattern already required an "iphone"/"apple" token to match at
+        # all, so reaching here *is* the brand proof. There is no rival vendor
+        # to guard against — nobody else ships a product called an iPhone.
+        return "high"
+
     own, rival = (
         (AMD_TOKENS, NVIDIA_TOKENS) if key.startswith("rx_") else (NVIDIA_TOKENS, AMD_TOKENS)
     )
@@ -258,7 +365,16 @@ def classify(title: str | None, description: str | None = None) -> Match:
         if model.vram is not None:
             if vram != model.vram:
                 continue
-            return Match(model.key, model.display, _confidence(norm_title, True, model.key), vram)
-        return Match(model.key, model.display, _confidence(norm_title, False, model.key), vram)
+            confidence = _confidence(norm_title, True, model.key)
+        else:
+            confidence = _confidence(norm_title, False, model.key)
+        # Storage is title-only. Unlike VRAM there is no fallback to the
+        # description: phone descriptions list iCloud sizes, SD cards and the
+        # seller's other handsets, and a wrong tier moves the price by ~150 EUR.
+        storage = extract_storage(norm_title) if model.family == "phone" else None
+        return Match(
+            model.key, model.display, confidence, vram,
+            family=model.family, storage=storage,
+        )
 
     return NO_MATCH

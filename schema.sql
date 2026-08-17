@@ -58,6 +58,10 @@ alter table listings add column if not exists whole_machine boolean default fals
 alter table listings add column if not exists posted_at timestamptz;
   -- the seller's real created_at, not when we first saw it
 alter table listings add column if not exists user_allows_shipping boolean;
+alter table listings add column if not exists family text;
+  -- 'gpu' | 'phone' — drives the per-family alert price cap
+alter table listings add column if not exists storage text;
+  -- phones: '128gb' | '256gb' | '512gb' | '1tb'
   -- distinct from `shipping` (item_is_shippable), which is a category
   -- capability rather than this seller's choice
 

@@ -7,6 +7,7 @@ an ephemeral GitHub Actions runner (or a future Oracle VM) interchangeable.
 from __future__ import annotations
 
 import logging
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable, Sequence
 
@@ -55,9 +56,48 @@ class Database:
         return res.data or []
 
     # ------------------------------------------------------------- listings
+    # Columns this process has learned the live table does not have. Code and
+    # schema deploy independently here: a push reaches the runner within
+    # minutes while schema.sql is applied by hand, so for a while the code
+    # writes columns that do not exist yet. Without this, that window is a hard
+    # outage — PostgREST rejects the whole batch with PGRST204 and every
+    # listing in the run is lost, rather than just the new field.
+    _missing_columns: set[str] = set()
+
+    @staticmethod
+    def _unknown_column(exc: Exception) -> str | None:
+        """The column name PostgREST is complaining about, if that's the error."""
+        message = str(exc)
+        if "PGRST204" not in message and "Could not find" not in message:
+            return None
+        match = re.search(r"'([^']+)' column", message) or re.search(
+            r"Could not find the '([^']+)'", message
+        )
+        return match.group(1) if match else None
+
     def upsert_listings(self, rows: list[dict]) -> None:
         for batch in chunked(rows):
-            self.c.table("listings").upsert(list(batch), on_conflict="item_id").execute()
+            payload = [
+                {k: v for k, v in row.items() if k not in self._missing_columns}
+                for row in batch
+            ]
+            while True:
+                try:
+                    self.c.table("listings").upsert(payload, on_conflict="item_id").execute()
+                    break
+                except Exception as exc:
+                    column = self._unknown_column(exc)
+                    if column is None or column in self._missing_columns:
+                        raise
+                    log.warning(
+                        "listings has no column %r yet — dropping it and retrying. "
+                        "Apply the ALTER statements in schema.sql to persist it.",
+                        column,
+                    )
+                    self._missing_columns.add(column)
+                    payload = [
+                        {k: v for k, v in row.items() if k != column} for row in payload
+                    ]
 
     def get_listings(self, item_ids: Sequence[str]) -> dict[str, dict]:
         out: dict[str, dict] = {}

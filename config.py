@@ -45,10 +45,24 @@ DEFAULT_DISTANCE_KM = _i("WP_DEFAULT_DISTANCE_KM", 100)
 # laptops. Category filtering only works client-side, off each item's
 # `taxonomy` array. See TAXONOMY_* below.
 CATEGORY_GPU = "24200"
+CATEGORY_PHONE = "24201"   # "Telefonía: móviles y smartwatches"
 
 # ------------------------------------------------------------ taxonomy leaves
 # Read off /api/v3/categories (verified live 2026-08-02).
 TAXONOMY_COMPONENTS = 10304          # "Componentes y piezas de ordenador"
+TAXONOMY_SMARTPHONES = 9447          # "Smartphones"
+
+# Phone accessories and spare parts live in sibling leaves, never under 9447 —
+# a case, a charger or a replacement battery is a different product that merely
+# names the phone it fits. Listed for reference; the junk rules catch them by
+# phrase, which also works on the many listings filed in the wrong leaf.
+TAXONOMY_PHONE_ACCESSORIES = frozenset({
+    9375,    # Accesorios de móviles y smartwatches
+    10428,   # Fundas y carcasas
+    10423,   # Baterías para móviles
+    10427,   # Cargadores y cables
+    9388,    # Piezas de recambio
+})
 
 # Whole-machine categories. A GPU inside one of these is not a loose card, so
 # its price is not a comp for one.
@@ -82,10 +96,26 @@ class FeeModel:
     target_margin: float
     label: str
 
+    def required_margin(self, ref_price: float) -> float:
+        """What this flip has to clear, in euros.
+
+        A flat target is wrong for expensive items. TARGET_MARGIN=50 is a 25%
+        return on a 200 EUR card and a 7% return on a 700 EUR phone — the same
+        rule that is demanding on a GPU is trivially satisfied by almost every
+        iPhone listing, which is exactly what happened the first time phones
+        were switched on: 111 alerts in one pass, nearly all of them ordinary
+        listings rather than bargains.
+
+        So the requirement is whichever is greater: the flat floor, or a
+        percentage of what the item is worth. Capital tied up in a 700 EUR
+        phone should earn proportionally more than capital in a 200 EUR card.
+        """
+        return max(self.target_margin, MARGIN_RATE * ref_price)
+
     def buy_ceiling(self, ref_price: float) -> float:
-        """Max purchase price that still nets >= target_margin."""
+        """Max purchase price that still clears the required margin."""
         gross = ref_price * (1 - self.seller_fee)
-        return (gross - self.buyer_fixed - self.shipping_in - self.target_margin) / (
+        return (gross - self.buyer_fixed - self.shipping_in - self.required_margin(ref_price)) / (
             1 + self.buyer_fee
         )
 
@@ -97,6 +127,29 @@ class FeeModel:
 
 
 TARGET_MARGIN = _f("TARGET_MARGIN", 50.0)
+
+# Minimum return as a fraction of what the item is worth, applied alongside the
+# flat TARGET_MARGIN floor — whichever demands more wins. Without this the flat
+# floor silently becomes a rounding error on expensive stock.
+#
+# The crossover is TARGET_MARGIN / MARGIN_RATE, so at the defaults anything
+# with a reference under ~278 EUR is still governed by the 50 EUR floor exactly
+# as before. Above that the rate binds, which does tighten the existing feed
+# for mid and high-tier cards: a 4070 at ref 330 now has to clear 59 EUR rather
+# than 50, and a 4080 at ref 620 has to clear 112. That is the intended
+# correction — 50 EUR on a 620 EUR card is an 8% return for the same work and
+# the same risk as a 25% one on a 200 EUR card. Set MARGIN_RATE=0 to restore
+# the old flat-only behaviour.
+MARGIN_RATE = _f("MARGIN_RATE", 0.18)
+
+# Extra margin demanded while a model is still priced from its hand-written
+# seed rather than from real reserved/sold comps. A seed is an educated guess
+# at what something is worth, and the whole feed is only as good as that guess:
+# if a seed is 25% too high, every ordinary listing looks like a bargain and the
+# alert stream becomes noise. Demanding more while confidence is low, and
+# relaxing automatically once MIN_COMPS real comps exist, is the honest way to
+# express that — rather than quietly tolerating a week of false positives.
+SEED_MARGIN_MULTIPLIER = _f("SEED_MARGIN_MULTIPLIER", 1.6)
 
 # Default: shipped both ways — the worst case, and the gate we alert on.
 # seller_fee=0 because Wallapop charges the seller nothing; only the buyer pays
@@ -214,14 +267,49 @@ MAX_SANE_PRICE = _f("MAX_SANE_PRICE", 4000.0)
 # present the offer and see if the seller bites.
 OFFER_DISCOUNT = _f("OFFER_DISCOUNT", 0.20)
 
+# Floor on how far below the reference price a listing can plausibly sit and
+# still be real. Below this fraction of ref_price it is a scam, a replica, an
+# empty box, a spare part or a repair service priced as a handset — never a
+# bargain. Measured on the first live phone run: an "iPhone 17 Pro Max 1TB" at
+# 350 EUR against an 880 EUR reference, and a "iPhone 16 Pro Max Réplica" at
+# 150, both sorted to the very top of the feed precisely because the margin
+# looked enormous.
+#
+# The margin engine cannot catch these on its own: the further from reality a
+# fake price is, the better the deal it computes. This is deliberately generous
+# — a genuine bargain at half the reference still passes.
+MIN_PLAUSIBLE_RATIO = _f("MIN_PLAUSIBLE_RATIO", 0.35)
+
 # Hard ceiling on what may ever trigger an alert, applied to the *asking*
 # price before any margin maths. This is a scope decision, not a maths one:
-# above it the capital at risk stops being worth it, and it's also what keeps
-# whole PCs and gaming laptops out of the feed without needing to identify
-# them — a machine with a card in it is essentially never listed under this.
-# Comps are deliberately NOT capped: the reference price needs the full
-# distribution to be meaningful.
+# above it the capital at risk stops being worth it, and for GPUs it's also
+# what keeps whole PCs and gaming laptops out of the feed without needing to
+# identify them — a machine with a card in it is essentially never listed
+# under this. Comps are deliberately NOT capped: the reference price needs the
+# full distribution to be meaningful.
 MAX_ALERT_PRICE = _f("MAX_ALERT_PRICE", 350.0)
+
+# Phones need their own ceiling. A used iPhone 15 Pro sits around 550 EUR and a
+# 17 Pro Max near 1000, so the GPU cap would silently mute the entire category
+# rather than filter it. This is the one number to change if the capital at
+# risk per phone feels wrong — the margin gate still has to clear underneath.
+MAX_ALERT_PRICE_PHONE = _f("MAX_ALERT_PRICE_PHONE", 900.0)
+
+# Per-family caps, keyed by models.ModelDef.family.
+MAX_ALERT_PRICE_BY_FAMILY = {
+    "gpu": MAX_ALERT_PRICE,
+    "phone": MAX_ALERT_PRICE_PHONE,
+}
+
+
+def max_alert_price(family: str | None) -> float:
+    """Cap for a family, falling back to the strictest one we know.
+
+    An unclassified listing gets the GPU cap rather than the loosest one: a
+    listing we couldn't identify is the last thing that should be handed the
+    most permissive budget.
+    """
+    return MAX_ALERT_PRICE_BY_FAMILY.get(family or "", MAX_ALERT_PRICE)
 
 # ------------------------------------------------------------------- ops
 # observations grows by ~one row per listing per run; at a 5-minute cadence
