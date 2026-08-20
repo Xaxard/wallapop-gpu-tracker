@@ -955,9 +955,30 @@ def test_seed_penalty_can_be_disabled(monkeypatch):
     assert pricing.evaluate(500.0, _row(560.0, is_seed=True), None).qualifies
 
 
-def test_implausibly_cheap_is_rejected_whatever_the_margin_says():
-    """The margin engine is structurally blind here: the more absurd the price,
-    the better the margin it computes, so fakes sort to the top of the feed."""
+def test_an_extremely_cheap_listing_still_qualifies():
+    """MIN_PLAUSIBLE_RATIO is disabled by owner decision, for every model — it
+    is one global ratio, not a per-card setting, so this holds across the whole
+    registry. The margin engine is structurally blind to fakes and this used to
+    be the compensating guard; it was removed because it could not distinguish a
+    replica from a genuine steal, and the owner would rather judge that from the
+    listing itself than lose the best finds to a filter."""
+    deal = pricing.evaluate(150.0, _row(700.0, is_seed=False), None)
+    assert deal.qualifies
+    assert deal.ref_price == 700.0
+
+
+def test_the_sanity_floor_is_now_the_only_lower_bound():
+    """With the plausibility ratio off, MIN_SANE_PRICE is all that stands
+    between the feed and a 20 EUR listing claiming to be a 700 EUR card."""
+    assert not pricing.evaluate(49.0, _row(700.0, is_seed=False), None).qualifies
+    assert pricing.evaluate(50.0, _row(700.0, is_seed=False), None).qualifies
+
+
+def test_disabling_the_ratio_is_a_choice_not_an_accident(monkeypatch):
+    """Guards the two tests above from silently becoming vacuous: the gate is
+    still wired up and still works, it is the *default* that was changed. Set
+    the ratio and the old rejection comes straight back."""
+    monkeypatch.setattr(pricing.config, "MIN_PLAUSIBLE_RATIO", 0.35)
     deal = pricing.evaluate(150.0, _row(700.0, is_seed=False), None)
     assert not deal.qualifies
     assert "implausibly cheap" in deal.reason

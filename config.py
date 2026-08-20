@@ -319,18 +319,32 @@ MIN_COMP_PRICE = _f("MIN_COMP_PRICE", 50.0)
 # present the offer and see if the seller bites.
 OFFER_DISCOUNT = _f("OFFER_DISCOUNT", 0.20)
 
-# Floor on how far below the reference price a listing can plausibly sit and
-# still be real. Below this fraction of ref_price it is a scam, a replica, an
-# empty box, a spare part or a repair service priced as a handset — never a
-# bargain. Measured on the first live phone run: an "iPhone 17 Pro Max 1TB" at
-# 350 EUR against an 880 EUR reference, and a "iPhone 16 Pro Max Réplica" at
-# 150, both sorted to the very top of the feed precisely because the margin
-# looked enormous.
+# Floor on how far below the reference price a listing may sit, as a fraction
+# of ref_price, applied before any margin maths.
 #
-# The margin engine cannot catch these on its own: the further from reality a
-# fake price is, the better the deal it computes. This is deliberately generous
-# — a genuine bargain at half the reference still passes.
-MIN_PLAUSIBLE_RATIO = _f("MIN_PLAUSIBLE_RATIO", 0.35)
+# DISABLED (0.0) BY THE OWNER, DELIBERATELY. Do not re-enable without asking.
+#
+# It was 0.35, and it worked as designed: the margin engine is structurally
+# blind to fakes, because the further from reality a price is the better the
+# deal it computes, so replicas, empty boxes, spare parts and bait sort straight
+# to the top of a feed ranked by margin.
+#
+# The problem is that the guard is symmetric and cannot tell a scam from a
+# steal. At 0.35 an RTX 3070 against a ~200 EUR reference was rejected below
+# 70.23 EUR — so a genuine drawer-clearing sale at 65 EUR, the single most
+# profitable listing the bot could ever find, was silently dropped, while a
+# replica at 71 EUR passed anyway. The owner's call, made with those numbers in
+# front of them: send everything that clears the margin and let a human judge
+# legitimacy from the photos, the seller and the description. Deciding that is
+# cheap for a person and expensive for a filter.
+#
+# MIN_SANE_PRICE (50 EUR) is now the only lower bound, and it is the one the
+# owner asked to keep. Anything under 50 EUR is still never sent.
+#
+# Set MIN_PLAUSIBLE_RATIO=0.35 to restore the old behaviour. Every alert still
+# prints the reference price next to the asking price, so the ratio this used to
+# enforce is visible on the message and can be judged by eye.
+MIN_PLAUSIBLE_RATIO = _f("MIN_PLAUSIBLE_RATIO", 0.0)
 
 # Ceiling on what may trigger an alert *without* a reference price behind it.
 #

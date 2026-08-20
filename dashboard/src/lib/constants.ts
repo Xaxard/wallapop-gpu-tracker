@@ -84,18 +84,24 @@ export const OFFER_DISCOUNT = num("OFFER_DISCOUNT", 0.2);
 
 /**
  * config.py: `MIN_PLAUSIBLE_RATIO`. Floor on how far below the reference a
- * listing can sit and still be real.
+ * listing may sit, as a fraction of ref_price.
  *
- * This is the single most important line in this file for the deal list, and
- * the one that was missing. The margin engine is structurally blind to fakes:
- * the more absurd a price is, the *better* the margin it computes. So replicas,
- * empty boxes, spare parts and repair services priced as whole items sort
- * straight to the top of anything ranked by margin — and `getLiveDeals` ranks
- * by net margin descending. Anything under this fraction of the reference is
- * suppressed. Deliberately generous: a genuine bargain at half the reference
- * still passes.
+ * DISABLED (0) BY OWNER DECISION — must stay in step with config.py, which is
+ * also 0. Do not "fix" this back to 0.35 to match the old comment above.
+ *
+ * It was 0.35 and it was the guard against the margin engine's one structural
+ * blind spot: the more absurd a price, the better the margin it computes, so
+ * replicas and empty boxes sort straight to the top of a list ranked by margin
+ * — and this list is ranked by margin. It came off anyway, because the guard is
+ * symmetric and cannot tell a scam from a genuine steal, and the owner would
+ * rather judge legitimacy from the listing than lose the best finds to a filter.
+ *
+ * The practical consequence here is sharper than in the tracker: a Telegram
+ * alert is one message a person reads, while this list is sorted worst-price-
+ * first by construction. Fakes will now appear at the top. MIN_SANE_PRICE (50)
+ * is the only remaining lower bound.
  */
-export const MIN_PLAUSIBLE_RATIO = num("MIN_PLAUSIBLE_RATIO", 0.35);
+export const MIN_PLAUSIBLE_RATIO = num("MIN_PLAUSIBLE_RATIO", 0);
 
 /** config.py: `MIN_SANE_PRICE` / `MAX_SANE_PRICE`. `pricing.evaluate` rejects
  *  anything outside this band before doing any margin maths at all. A GPU under
@@ -304,9 +310,8 @@ export function evaluateDeal(price: number | null, model: PricedModel | undefine
   // list deliberately does not mirror.
   if (price > MAX_CAPITAL_PRICE) return miss("above the capital cap", refPrice);
 
-  // Too cheap to be true — see MIN_PLAUSIBLE_RATIO. This has to come before the
-  // margin test, because the margin test is exactly what such a listing passes
-  // most convincingly.
+  // Disabled by default (ratio 0), so this never fires — kept because the
+  // ratio is an env var and the decision is reversible. See MIN_PLAUSIBLE_RATIO.
   if (price < refPrice * MIN_PLAUSIBLE_RATIO) {
     return miss(`implausibly cheap (${price.toFixed(0)} vs ref ${refPrice.toFixed(0)})`, refPrice);
   }

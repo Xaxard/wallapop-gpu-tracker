@@ -487,11 +487,19 @@ def evaluate(price: float, model_row: dict | None, bootstrap_cap: float | None) 
     if model_row and model_row.get("ref_price"):
         ref = float(model_row["ref_price"])
 
-        # Too cheap to be true. The margin engine is structurally blind to this
-        # on its own: the more absurd the price, the better the margin it
-        # computes, so fakes and mispriced spare parts sort straight to the top
-        # of the feed. Anything under MIN_PLAUSIBLE_RATIO of the reference is a
-        # replica, an empty box, a part, a repair service or outright bait.
+        # Owner-disabled: MIN_PLAUSIBLE_RATIO defaults to 0.0, so this branch is
+        # inert and every listing that clears the margin is sent regardless of
+        # how far under the reference it sits.
+        #
+        # It is kept rather than deleted because the ratio is an env var and the
+        # decision is reversible — see the long note in config.py for why it was
+        # turned off, and what it costs. In short: the guard could not tell a
+        # replica from a drawer-clearing bargain, and the owner would rather
+        # judge that themselves from the photos and the seller than have the
+        # most profitable listings silently dropped.
+        #
+        # MIN_SANE_PRICE still applies above, so nothing under 50 EUR reaches
+        # here in the first place.
         if price < ref * config.MIN_PLAUSIBLE_RATIO:
             return Deal(
                 False,

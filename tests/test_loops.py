@@ -579,16 +579,23 @@ def test_seller_id_is_persisted_by_both_loops(wire):
     assert cdb.listings[0]["seller_id"] == "u42"
 
 
-def test_implausibly_cheap_listing_is_treated_as_fraud_not_as_a_deal(wire):
-    """A deliberate trade-off, and the one place the margin engine is
-    structurally blind: the more absurd a price is, the better the margin it
-    computes, so fakes sort straight to the top of the feed. A 4090 at 340
-    against a 1200 reference is a scam, a dead card or bait essentially every
-    time — genuine mispricing that extreme is vanishingly rare and gone in
-    seconds anyway.
+def test_an_extremely_cheap_listing_is_sent_for_the_owner_to_judge(wire):
+    """The owner's explicit decision, reversing an earlier trade-off.
 
-    This does cost the occasional real steal. MIN_PLAUSIBLE_RATIO is the knob:
-    lower it to buy back the tail, at the price of fraud in the feed.
+    The margin engine is structurally blind here — the more absurd a price, the
+    better the margin it computes — and MIN_PLAUSIBLE_RATIO used to reject
+    anything under 35% of the reference for exactly that reason. It was turned
+    off because it could not tell a replica from a drawer-clearing bargain, and
+    it dropped the single most profitable listing the bot could ever find in
+    order to also drop the fakes. Legitimacy is cheap for a person to judge from
+    photos, a seller profile and a description, and expensive for a filter.
+
+    So a 4090 at 340 against a 1200 reference is now sent, and the caption
+    carries the reference price next to the asking price so the ratio this used
+    to enforce is visible by eye.
+
+    Set MIN_PLAUSIBLE_RATIO=0.35 to restore the old behaviour; this test then
+    fails, which is the point — it pins a policy choice, not an accident.
     """
     search = dict(ALERT_SEARCH, label="RTX 4090", keywords="rtx 4090",
                   model_key="rtx_4090", max_price=None)
@@ -596,6 +603,22 @@ def test_implausibly_cheap_listing_is_treated_as_fraud_not_as_a_deal(wire):
                            "buy_ceiling_in_person": 1150.0, "n_comps": 9, "is_seed": False}}
     db = FakeDB([search], prices)
     tg = wire(alert_loop, db, [make_item("a13", "RTX 4090 Gigabyte", 340.0)])
+
+    assert alert_loop.run_once()["alerts_sent"] == 1
+    assert len(tg.sent) == 1
+
+
+def test_nothing_under_the_sanity_floor_is_ever_sent(wire):
+    """The one lower bound the owner kept. MIN_PLAUSIBLE_RATIO is off, so this
+    is now the *only* thing standing between the feed and a 20 EUR "RTX 4090" —
+    which makes it load-bearing in a way it was not before.
+    """
+    search = dict(ALERT_SEARCH, label="RTX 4090", keywords="rtx 4090",
+                  model_key="rtx_4090", max_price=None)
+    prices = {"rtx_4090": {"ref_price": 1200.0, "buy_ceiling": 1050.0,
+                           "buy_ceiling_in_person": 1150.0, "n_comps": 9, "is_seed": False}}
+    db = FakeDB([search], prices)
+    tg = wire(alert_loop, db, [make_item("a14", "RTX 4090 Gigabyte", 49.0)])
 
     assert alert_loop.run_once()["alerts_sent"] == 0
     assert tg.sent == []
