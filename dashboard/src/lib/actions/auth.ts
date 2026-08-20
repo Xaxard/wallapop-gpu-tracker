@@ -2,6 +2,7 @@
 
 import { cookies } from "next/headers";
 import { redirect } from "next/navigation";
+import type { LoginState } from "@/lib/actions/auth-state";
 import {
   SESSION_COOKIE,
   authEnv,
@@ -10,11 +11,6 @@ import {
   signSession,
 } from "@/lib/auth/session";
 
-export interface LoginState {
-  error: string | null;
-}
-
-export const initialLoginState: LoginState = { error: null };
 
 /** Only same-origin paths may be redirected to after login (see proxy.ts). */
 function safeNextPath(value: FormDataEntryValue | null): string {
