@@ -545,7 +545,8 @@ def run_once() -> dict:
             f"junk_filtered={stats['junk']} over_cap={stats['over_cap']} "
             f"blocked_condition={stats['blocked_condition']} "
             f"blocked_seller={stats['blocked_seller']} "
-            f"whole_machine={stats['whole_machine']}"
+            f"whole_machine={stats['whole_machine']} "
+            f"comps_only_family={stats['non_alerting_family']}"
         )
         if samples:
             notes += f" median_latency_s={statistics.median(samples):.0f}"
