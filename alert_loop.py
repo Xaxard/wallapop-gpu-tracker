@@ -141,13 +141,33 @@ def _relevant(search: dict, match: models.Match) -> bool:
     comes back with Ryzen CPUs and wifi cards. Under a bootstrap cap those would
     all "qualify", so a model-targeted search only accepts listings that
     actually classify to that model.
+
+    "Actually classify" means priceable — high or medium confidence. A `low`
+    match is precisely the case where the number was found but nothing
+    corroborates it, and letting one through here reopens, on the bootstrap
+    path, the hole that capping description matches closed on the pricing path:
+    the margin engine is skipped entirely (model_row stays None for an
+    unpriceable match), so the listing falls through to the search's flat cap
+    and alerts as a bare "matches your search".
+
+    Measured on the live feed, two such alerts in three days after the
+    description fix landed:
+
+        "Placa gráfica Palit RTX 2070 Super"   -> rtx_3060_ti, 185 EUR
+             description: "Tiene el rendimiento de RTX3060TI 8GB"
+        "Aoostar AG02 eGPU Adaptador en caja"  -> rtx_4060, 125 EUR
+
+    Neither is the card it matched; both name one in passing. A confidently
+    classified model with no comps yet still reaches the bootstrap path, which
+    is what that path is for — confidence and having-a-reference-price are
+    different questions.
     """
     model_key = search.get("model_key")
     if model_key:
-        return models.same_family(model_key, match.model_key)
+        return match.priceable and models.same_family(model_key, match.model_key)
     if search.get("category_ids"):
         # Broad discovery searches: must at least be an identifiable card.
-        return match.model_key is not None
+        return match.priceable
     # Bare keyword watches with no category stay plain keyword matches.
     return True
 

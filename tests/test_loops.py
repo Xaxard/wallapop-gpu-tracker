@@ -1295,3 +1295,42 @@ def test_a_gpu_still_alerts_with_the_family_guard_in_place():
     everything."""
     assert "gpu" in alert_loop.ALERTING_FAMILIES
     assert "phone" not in alert_loop.ALERTING_FAMILIES
+
+
+def test_a_low_confidence_match_cannot_alert_through_the_bootstrap_cap(wire):
+    """The hole the description-confidence cap left open on the other path.
+
+    An unpriceable match never gets a model_row, so pricing.evaluate skips the
+    margin engine entirely and falls through to the search's flat bootstrap cap
+    — which the listing passes on price alone. Two of these reached the live
+    feed in the three days after the description fix landed:
+
+        "Placa gráfica Palit RTX 2070 Super"  -> rtx_3060_ti at 185 EUR,
+             because its description reads "Tiene el rendimiento de RTX3060TI"
+        "Aoostar AG02 eGPU Adaptador"         -> rtx_4060 at 125 EUR
+
+    Neither is the card it matched. Both merely name one.
+    """
+    search = dict(ALERT_SEARCH, label="RTX 3060 Ti", keywords="rtx 3060 ti",
+                  model_key="rtx_3060_ti", max_price=185)
+    db = FakeDB([search], {})
+    tg = wire(alert_loop, db, [make_item(
+        "lc1", "Placa gráfica Palit RTX 2070 Super PCIx8", 185.0,
+        description="Placa grafica Palit RTX 2070 Super. Tiene el rendimiento de RTX3060TI 8GB.",
+    )])
+
+    assert alert_loop.run_once()["alerts_sent"] == 0
+    assert tg.sent == []
+
+
+def test_a_confident_match_with_no_comps_still_uses_the_bootstrap_cap(wire):
+    """Guards the fix from over-reaching. Confidence and having-a-reference-
+    price are different questions: a model classified from its own title, with
+    no comps collected yet, is exactly what the bootstrap path exists for."""
+    search = dict(ALERT_SEARCH, label="RTX 3060 Ti", keywords="rtx 3060 ti",
+                  model_key="rtx_3060_ti", max_price=185)
+    db = FakeDB([search], {})
+    tg = wire(alert_loop, db, [make_item("hc1", "RTX 3060 Ti Gigabyte OC 8GB", 170.0)])
+
+    assert alert_loop.run_once()["alerts_sent"] == 1
+    assert len(tg.sent) == 1
