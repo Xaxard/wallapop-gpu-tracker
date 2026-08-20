@@ -115,6 +115,61 @@ COMPS_MODELS = [
     ("rx_9070_xt", "rx 9070 xt"),
 ]
 
+# ---------------------------------------------------------------- phones
+# iPhone 15 through 17, tracked for COMPS ONLY. There are deliberately no alert
+# searches here and there never should be: the owner asked to learn what these
+# actually sell for before deciding whether to trade them, and
+# alert_loop.ALERTING_FAMILIES enforces that independently of this list, so a
+# phone cannot alert even if a search row is added by hand.
+#
+# Keywords are the bare model names. models.classify requires the literal word
+# "iphone" before the number (see _iph), so "15 pro" alone can never match a
+# quantity or a size elsewhere in a title.
+PHONE_COMPS = [
+    ("iphone_15", "iphone 15"),
+    ("iphone_15_plus", "iphone 15 plus"),
+    ("iphone_15_pro", "iphone 15 pro"),
+    ("iphone_15_pro_max", "iphone 15 pro max"),
+    ("iphone_16", "iphone 16"),
+    ("iphone_16_plus", "iphone 16 plus"),
+    ("iphone_16e", "iphone 16e"),
+    ("iphone_16_pro", "iphone 16 pro"),
+    ("iphone_16_pro_max", "iphone 16 pro max"),
+    ("iphone_17", "iphone 17"),
+    ("iphone_17_pro", "iphone 17 pro"),
+    ("iphone_17_pro_max", "iphone 17 pro max"),
+    ("iphone_air", "iphone air"),
+]
+
+# Measured off the live API on 2026-08-18: two pages per model, junk-filtered
+# and classified, median of the asking prices that survived (n between 14 and
+# 77 per model).
+#
+# Shaded ~8% below those medians on purpose. They are *asking* prices, and this
+# project's whole position on comps is that asks measure optimism rather than
+# the market — the same reason ref_price is built only from reserved and sold
+# listings. A seed is a prior, not a price, and it is replaced the moment
+# MIN_COMPS real comps exist.
+#
+# The measured medians put the 17 Pro above the 17 Pro Max, which is an artefact
+# of thin sampling (n=15 against n=77) rather than the market; the seeds below
+# restore the ordering the hardware actually has.
+PHONE_SEED_PRICES = {
+    "iphone_15": 415,
+    "iphone_15_plus": 430,
+    "iphone_15_pro": 530,
+    "iphone_15_pro_max": 580,
+    "iphone_16e": 420,
+    "iphone_16": 570,
+    "iphone_16_plus": 600,
+    "iphone_16_pro": 710,
+    "iphone_16_pro_max": 760,
+    "iphone_17": 710,
+    "iphone_air": 710,
+    "iphone_17_pro": 1000,
+    "iphone_17_pro_max": 1100,
+}
+
 # Rough current-market resale values in EUR, used only until each model has
 # MIN_COMPS real comps. Adjust freely — they exist so day-one alerts aren't
 # nonsense, not to be accurate forever.
@@ -194,6 +249,9 @@ SEED_PRICES = {
 MIN_SEARCH_PRICE = config.MIN_SANE_PRICE
 
 
+SEED_PRICES.update(PHONE_SEED_PRICES)
+
+
 def build_search_rows() -> list[dict]:
     rows: list[dict] = []
 
@@ -243,6 +301,23 @@ def build_search_rows() -> list[dict]:
                 # the alert searches. A sub-50 EUR listing is barred from the
                 # comps pool by MIN_COMP_PRICE anyway, so nothing that could
                 # move a median is being filtered out here.
+                "max_price": None,
+                "min_price": MIN_SEARCH_PRICE,
+                "distance_km": None,
+                "active": True,
+            }
+        )
+
+    for model_key, keywords in PHONE_COMPS:
+        rows.append(
+            {
+                "label": f"Comps {keywords.upper()}",
+                "role": "comps",
+                "keywords": keywords,
+                "model_key": model_key,
+                # No category: CATEGORY_GPU is meaningless for a handset, and
+                # the API ignores category_ids anyway (see config).
+                "category_ids": None,
                 "max_price": None,
                 "min_price": MIN_SEARCH_PRICE,
                 "distance_km": None,

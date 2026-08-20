@@ -117,6 +117,53 @@ LAPTOP_PHRASES = (
 # "microprocesador" only ever show up when the product itself is a CPU.
 CPU_TOKENS = ("procesador", "microprocesador")
 
+# Phone accessories and services, not phones. These are the dominant noise on
+# any iPhone search: a "Funda iPhone 15" at 8 EUR against a 700 EUR reference is
+# a 99% margin by the maths and pure junk in reality — it is the listing named
+# in db.log_junk's own docstring as what filled that table with 2.86M rows.
+#
+# Split in two, because this file's founding rule is that a single word may
+# never exclude. "iPhone 15 con funda incluida" is a real phone sold with a
+# case, and banning the bare word "funda" kills it — a working listing rejected
+# for describing an extra, and invisible, because exclusions are never alerted.
+#
+# So an accessory noun only excludes when the title *opens* with it, which is
+# how these listings are actually written ("Funda iPhone 15 Pro"). "Replica" and
+# "clon" sit here rather than in the phrase list for the same reason: sellers
+# write "100% original, no replica" constantly.
+PHONE_ACCESSORY_PREFIXES = frozenset({
+    "funda", "fundas", "carcasa", "protector", "protectores",
+    "cargador", "cargadores", "cable", "cables", "adaptador",
+    "pantalla", "pantallas", "bateria", "baterias", "tapa",
+    "camara", "placa", "soporte", "cristal", "replica", "clon",
+    "maqueta", "imitacion", "repuesto", "repuestos",
+})
+
+# Phrases that mean "not a sellable handset" wherever they appear. Multi-word,
+# so each carries its own context and cannot straddle an innocent sentence.
+PHONE_NOT_A_PHONE = (
+    "protector de pantalla",
+    "cristal templado",
+    "cambio de pantalla",
+    "reparacion de",
+    "reparamos",
+    "pantalla para",
+    "bateria para",
+    "cargador para",
+    "tapa trasera",
+    "camara para",
+    "solo la placa",
+    "placa base",
+    # An iCloud-locked handset cannot legally be resold and goes for a fraction
+    # of a working one. Letting one price the pool drags the reference down for
+    # every clean handset of that model.
+    "libre de icloud",
+    "bloqueado por icloud",
+    "bloqueado icloud",
+    "cuenta icloud",
+)
+
+
 # Patterns are matched against the *normalised* title, where normalise() has
 # already split letter/digit runs ("i7 14650HX" -> "i 7 14650 hx").
 LAPTOP_REGEXES = (
@@ -186,6 +233,7 @@ _PHRASE_GROUPS_RX = tuple(
     (category, _compile(phrases)) for category, phrases in PHRASE_GROUPS
 )
 _BUNDLE_RX = _compile(BUNDLE)
+_PHONE_NOT_A_PHONE_RX = _compile(PHONE_NOT_A_PHONE)
 _LAPTOP_PHRASES_RX = _compile(LAPTOP_PHRASES)
 
 
@@ -208,6 +256,17 @@ class JunkVerdict:
 CLEAN = JunkVerdict(False)
 
 
+def _is_phone_title(norm_title: str) -> bool:
+    """Does this title name an iPhone?
+
+    Deliberately just the word. Every phone rule that follows is an accessory or
+    service pattern, so a false positive here costs nothing — a graphics card
+    whose title says "iphone" is not a graphics card either — while a false
+    negative lets "Funda iPhone 15" reach the margin engine at a 99% margin.
+    """
+    return re.search(r"\biphone\b", norm_title) is not None
+
+
 def _leads_with_card_noun(norm_title: str) -> bool:
     """True when the title opens by naming a graphics card."""
     head = " ".join(norm_title.split()[:3])
@@ -219,6 +278,18 @@ def check(title: str | None, description: str | None = None) -> JunkVerdict:
     norm_title = normalise(title)
     norm_desc = normalise(description) if description else ""
     haystack = f"{norm_title} {norm_desc}".strip()
+
+    # Phone rules first, and only for titles naming an iPhone. A phone listing
+    # has nothing to do with the bundle/laptop/CPU rules below, and those rules
+    # have nothing to say about it.
+    if _is_phone_title(norm_title):
+        words = norm_title.split()
+        if words and words[0] in PHONE_ACCESSORY_PREFIXES:
+            return JunkVerdict(True, words[0], "NOT_A_PHONE")
+        hit = _first_hit(norm_title, _PHONE_NOT_A_PHONE_RX)
+        if hit:
+            return JunkVerdict(True, hit, "NOT_A_PHONE")
+        return _shared_rules(norm_title, haystack)
 
     # Form-factor checks run on the title only and are skipped when the title
     # opens by naming a card, so "Gráfica RTX 4070 sacada de un portátil" stays.

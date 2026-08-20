@@ -1248,3 +1248,50 @@ def test_every_seeded_search_sends_a_price_floor():
     assert {r["role"] for r in rows} == {"alert", "comps"}
     for row in rows:
         assert row["min_price"] == config.MIN_SANE_PRICE, row["label"]
+
+
+# ------------------------------------------------------- comps-only families
+def test_a_phone_is_never_alerted_however_good_the_margin(wire):
+    """The owner asked for iPhone prices to be *tracked*, not traded. Nothing in
+    the margin maths knows that, so alert_loop.ALERTING_FAMILIES enforces it.
+
+    This is deliberately tested through a hand-built alert search targeting a
+    phone — a row seed.py never creates — because that is the failure this
+    guard exists for. Relying on "no phone alert search is seeded" would make
+    the protection a property of a data file that anyone can edit from the
+    dashboard, rather than of the code.
+    """
+    search = dict(ALERT_SEARCH, label="iPhone 15 Pro", keywords="iphone 15 pro",
+                  model_key="iphone_15_pro", max_price=None)
+    prices = {"iphone_15_pro": {"ref_price": 530.0, "buy_ceiling": 400.0,
+                                "buy_ceiling_in_person": 450.0, "n_comps": 20,
+                                "is_seed": False}}
+    db = FakeDB([search], prices)
+    tg = wire(alert_loop, db, [make_item("p1", "iPhone 15 Pro 256GB", 120.0)])
+
+    stats = alert_loop.run_once()
+    assert stats["alerts_sent"] == 0
+    assert stats["non_alerting_family"] == 1
+    assert tg.sent == []
+
+
+def test_a_phone_is_still_observed_so_its_comps_are_collected(wire):
+    """Not alerting must not mean not recording: the whole point of tracking a
+    family without alerting on it is to accumulate the price history."""
+    search = dict(ALERT_SEARCH, label="iPhone 15 Pro", keywords="iphone 15 pro",
+                  model_key="iphone_15_pro", max_price=None)
+    db = FakeDB([search], {})
+    wire(alert_loop, db, [make_item("p2", "iPhone 15 Pro 256GB", 480.0)])
+
+    alert_loop.run_once()
+    row = next(r for r in db.listings if r["item_id"] == "p2")
+    assert row["model_key"] == "iphone_15_pro"
+    assert row["family"] == "phone"
+    assert row["storage"] == "256gb"
+
+
+def test_a_gpu_still_alerts_with_the_family_guard_in_place():
+    """Guards the two tests above from passing because the guard rejects
+    everything."""
+    assert "gpu" in alert_loop.ALERTING_FAMILIES
+    assert "phone" not in alert_loop.ALERTING_FAMILIES

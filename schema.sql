@@ -60,22 +60,22 @@ alter table listings add column if not exists posted_at timestamptz;
 alter table listings add column if not exists user_allows_shipping boolean;
   -- this seller's choice on this listing, distinct from `shipping`
   -- (item_is_shippable), which is only the category's general capability
+-- Product family and capacity. Both were removed once, when phone tracking was
+-- reverted and nothing wrote them; both are back because iPhones are tracked
+-- again — for comps only, never for alerts (alert_loop.ALERTING_FAMILIES).
 --
--- `family` ('gpu' | 'phone') and `storage` ('128gb' | '256gb' | ...) used to be
--- declared here for multi-family tracking. Phone tracking was reverted, GPUs are
--- the only family, and nothing has ever written either column — models.py no
--- longer even carries a family field to write. The ALTERs are removed so a fresh
--- project never grows them.
---
--- They are NOT dropped automatically: this file is applied by hand and a
--- `drop column` is the one statement in it that could destroy data if the
--- assumption above is ever wrong. On a project that already has them, verify
--- they are empty and then drop them yourself:
---
---   select count(*) from listings where family is not null or storage is not null;
---   -- expect 0, then:
---   alter table listings drop column if exists family, drop column if exists storage;
---
+-- `family` is what makes a mixed registry safe to query: "what is a 4070 worth"
+-- and "what is a 15 Pro worth" are the same question over the same tables, and
+-- without this column the only way to tell a card row from a handset row is to
+-- pattern-match the model_key.
+alter table listings add column if not exists family text;
+  -- 'gpu' | 'phone'
+alter table listings add column if not exists storage text;
+  -- phones: '128gb' | '256gb' | '512gb' | '1tb' — the biggest price driver
+  -- within one model, recorded now so the pools can be split by capacity later
+  -- without a backfill that no longer has the titles to parse.
+create index if not exists listings_family_idx on listings (family);
+
 alter table listings add column if not exists country text;
   -- 'ES' | 'PT' | 'IT' | ... Wallapop is one shared cross-border marketplace
   -- and both loops search it nationwide, so the country is the only thing

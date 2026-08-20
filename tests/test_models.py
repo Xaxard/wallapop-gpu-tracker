@@ -347,3 +347,72 @@ def test_a_description_naming_no_model_is_still_no_match(description):
     assert match.model_key is None
     assert match.confidence == "none"
     assert not match.priceable
+
+
+# ------------------------------------------------------------------ phones
+@pytest.mark.parametrize("title,expected", [
+    ("iPhone 15 128GB negro", "iphone_15"),
+    ("iPhone 15 Plus 256 GB", "iphone_15_plus"),
+    ("iPhone 15 Pro 256GB titanio", "iphone_15_pro"),
+    ("iPhone 15 Pro Max 1TB", "iphone_15_pro_max"),
+    ("iPhone15Pro azul, impecable", "iphone_15_pro"),
+    ("Apple iPhone 16 128 GB", "iphone_16"),
+    ("iphone16e 128gb", "iphone_16e"),
+    ("iPhone 16 Pro Max 512GB", "iphone_16_pro_max"),
+    ("iPhone 17 Pro Max nuevo", "iphone_17_pro_max"),
+    ("iPhone Air 256GB", "iphone_air"),
+])
+def test_iphone_classification(title, expected):
+    assert models.classify(title).model_key == expected
+
+
+def test_the_most_specific_iphone_variant_wins():
+    """Same rule as the GPU registry: 'pro max' must be tested before 'pro',
+    and 'pro' before the bare number, or every Pro Max collapses into the base
+    model's pool and drags its median up by hundreds of euros."""
+    assert models.classify("iPhone 15 Pro Max").model_key == "iphone_15_pro_max"
+    assert models.classify("iPhone 15 Pro").model_key == "iphone_15_pro"
+    assert models.classify("iPhone 15").model_key == "iphone_15"
+
+
+def test_16e_is_not_swallowed_by_the_bare_16_pattern():
+    """normalise() splits '16e' into '16 e', so without its own entry above the
+    bare-16 pattern the 16e — a much cheaper phone — lands in the 16's pool."""
+    assert models.classify("iPhone 16e 128GB").model_key == "iphone_16e"
+
+
+def test_a_bare_number_is_never_an_iphone():
+    """_iph requires the literal word 'iphone'. Two-digit model numbers collide
+    with sizes, quantities and years all over marketplace text, so a bare '15
+    pro' must not match anything."""
+    assert models.classify("Vendo 15 pro unidades").model_key is None
+    assert models.classify("15 Pro Max").model_key is None
+    assert models.classify("Lote de 16 fundas, 15 pro max incluidas").model_key is None
+
+
+def test_iphones_carry_the_phone_family_and_gpus_do_not():
+    """family is what stops a handset reaching the alert path — see
+    alert_loop.ALERTING_FAMILIES."""
+    assert models.classify("iPhone 15 Pro").family == "phone"
+    assert models.classify("RTX 4070 Gigabyte").family == "gpu"
+
+
+@pytest.mark.parametrize("title,expected", [
+    ("iPhone 15 Pro 128GB", "128gb"),
+    ("iPhone 15 Pro Max 1TB", "1tb"),
+    ("iPhone 16 256 GB", "256gb"),
+    ("iPhone 16 Pro 512gb", "512gb"),
+    ("iPhone 15 Pro sin especificar", None),
+])
+def test_extract_storage(title, expected):
+    assert models.extract_storage(title) == expected
+
+
+def test_every_phone_model_has_a_comps_search():
+    """A tracked model with no comps search can never learn a real price and
+    stays pinned to its seed forever — the same invariant the GPU side has."""
+    import seed
+
+    phones = {m.key for m in models.REGISTRY if m.family == "phone"}
+    searched = {k for k, _ in seed.PHONE_COMPS}
+    assert phones - searched == set(), f"no comps search for: {sorted(phones - searched)}"

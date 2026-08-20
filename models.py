@@ -68,6 +68,8 @@ BRAND_TOKENS = (
 # listing reading "PC de escritorio HP P4 + Nvidia 7600GS" (a real listing, at
 # 60 EUR) classifies as an RX 7600, prices against a 200 EUR reference, and
 # reports a 143 EUR margin on a twenty-year-old card.
+APPLE_TOKENS = ("iphone", "apple")
+
 AMD_TOKENS = ("rx", "radeon", "amd")
 NVIDIA_TOKENS = ("rtx", "gtx", "nvidia", "geforce")
 
@@ -80,6 +82,12 @@ class ModelDef:
     pattern: str
     # When set, the match only counts if the text's VRAM equals this value.
     vram: int | None = None
+    # Which product this is. Removed once as dead scaffolding when phone
+    # tracking was reverted; it is load-bearing again now that iPhones are
+    # tracked for comps, because family decides which junk rules apply, how
+    # confidence is judged, and — critically — whether a match may ever alert.
+    # Only 'gpu' alerts. See alert_loop.ALERTING_FAMILIES.
+    family: str = "gpu"
 
 
 def _num(n: str, *suffix: str) -> str:
@@ -91,6 +99,20 @@ def _num(n: str, *suffix: str) -> str:
     parts = [rf"\b{n}"]
     for s in suffix:
         parts.append(rf"\s+{s}")
+    return "".join(parts) + r"\b"
+
+
+def _iph(n: str, *suffix: str) -> str:
+    """Pattern for an iPhone model number plus optional suffix words.
+
+    Requires the literal word "iphone" before the number. A bare "15 pro" is far
+    too generic to risk — unlike a GPU part number, which is distinctive on its
+    own, two-digit phone numbers collide with sizes, quantities and years all
+    over a marketplace listing.
+    """
+    parts = [r"\biphone\s+" + n]
+    for suf in suffix:
+        parts.append(rf"\s+{suf}")
     return "".join(parts) + r"\b"
 
 
@@ -151,6 +173,34 @@ REGISTRY: tuple[ModelDef, ...] = (
     ModelDef("rx_6650_xt", "RX 6650 XT", _num("6650", "xt")),
     ModelDef("rx_6600_xt", "RX 6600 XT", _num("6600", "xt")),
     ModelDef("rx_6600", "RX 6600", _num("6600")),
+    # ------------------------------------------------------------ iPhone
+    # Comps-only: tracked to learn what these actually sell for. Nothing here
+    # can alert — see alert_loop.ALERTING_FAMILIES.
+    #
+    # Ordered most-specific first like everything above, so "pro max" is tested
+    # before "pro" and "pro" before the bare number. normalise() has already
+    # split letter/digit runs, so "iPhone15Pro" arrives as "iphone 15 pro" and
+    # one spaced pattern matches every way people write these.
+    #
+    # `\s+` between tokens rather than optional separators because normalise()
+    # collapses everything to single spaces.
+    ModelDef("iphone_15_pro_max", "iPhone 15 Pro Max", _iph("15", "pro", "max"), family="phone"),
+    ModelDef("iphone_15_pro", "iPhone 15 Pro", _iph("15", "pro"), family="phone"),
+    ModelDef("iphone_15_plus", "iPhone 15 Plus", _iph("15", "plus"), family="phone"),
+    ModelDef("iphone_15", "iPhone 15", _iph("15"), family="phone"),
+    ModelDef("iphone_16_pro_max", "iPhone 16 Pro Max", _iph("16", "pro", "max"), family="phone"),
+    ModelDef("iphone_16_pro", "iPhone 16 Pro", _iph("16", "pro"), family="phone"),
+    ModelDef("iphone_16_plus", "iPhone 16 Plus", _iph("16", "plus"), family="phone"),
+    # 16e before 16: normalise() splits "16e" into "16 e", so the bare-16
+    # pattern would otherwise swallow it.
+    ModelDef("iphone_16e", "iPhone 16e", _iph("16", "e"), family="phone"),
+    ModelDef("iphone_16", "iPhone 16", _iph("16"), family="phone"),
+    ModelDef("iphone_17_pro_max", "iPhone 17 Pro Max", _iph("17", "pro", "max"), family="phone"),
+    ModelDef("iphone_17_pro", "iPhone 17 Pro", _iph("17", "pro"), family="phone"),
+    ModelDef("iphone_17", "iPhone 17", _iph("17"), family="phone"),
+    # The Air took the Plus slot in the 17 generation and carries no number, so
+    # it needs its own pattern rather than a _iph() call.
+    ModelDef("iphone_air", "iPhone Air", r"\biphone\s+air\b", family="phone"),
 )
 
 _COMPILED = tuple((m, re.compile(m.pattern)) for m in REGISTRY)
@@ -196,6 +246,7 @@ class Match:
     display: str | None
     confidence: str  # 'high' | 'medium' | 'low' | 'none'
     vram: int | None = None
+    family: str = "gpu"
 
     @property
     def priceable(self) -> bool:
@@ -276,6 +327,12 @@ def _confidence(norm_text: str, has_vram_proof: bool, key: str) -> str:
     still matched, and a listing can legitimately name both vendors ("cambio mi
     RX 7600 por una Nvidia").
     """
+    if key.startswith("iphone_"):
+        # Phones have no rival-vendor collision to resolve: the pattern itself
+        # requires the word "iphone", so the brand is already proven by the
+        # match. There is no equivalent of a bare "4070" here.
+        return "high" if _has_token(norm_text, APPLE_TOKENS) else "medium"
+
     own, rival = (
         (AMD_TOKENS, NVIDIA_TOKENS) if key.startswith("rx_") else (NVIDIA_TOKENS, AMD_TOKENS)
     )
@@ -331,7 +388,7 @@ def _scan(
         confidence = _confidence(brand_text, model.vram is not None, model.key)
         if ceiling is not None:
             confidence = _cap_confidence(confidence, ceiling)
-        return Match(model.key, model.display, confidence, vram)
+        return Match(model.key, model.display, confidence, vram, family=model.family)
 
     return None
 
@@ -429,3 +486,43 @@ def classify(title: str | None, description: str | None = None) -> Match:
             return match
 
     return NO_MATCH
+
+
+FAMILY_BY_KEY = {m.key: m.family for m in REGISTRY}
+
+
+def family_of(model_key: str | None) -> str | None:
+    """Family for a stored model_key, for callers that kept only the key.
+
+    The loops classify once and carry the Match around, so they read
+    `match.family` directly. This exists for the paths that start from a
+    persisted `model_key` — a comps search row, a model_prices row — and need to
+    know whether they are looking at a card or a phone.
+    """
+    return FAMILY_BY_KEY.get(model_key or "")
+
+
+# iPhone capacities, as sold. Written against the normalised text, where
+# normalise() has already split letter/digit runs ("256GB" -> "256 gb").
+STORAGE_RE = re.compile(r"\b(64|128|256|512)\s*gb\b|\b(1|2)\s*tb\b")
+
+
+def extract_storage(text: str | None) -> str | None:
+    """Capacity named in the text, as a canonical token ('256gb', '1tb').
+
+    Recorded on the listing rather than folded into the model key. Capacity is
+    the single biggest price driver within one iPhone model — a 15 Pro Max 1TB
+    is hundreds of euros above the 256GB — so a pool mixing them is noisy, and
+    splitting it later will need this column populated from the start.
+
+    Not split into separate registry entries yet, the way GPU VRAM is: that
+    quadruples the model count and thins every pool below MIN_COMPS before a
+    single comp has been collected. Capture first, split once the data says the
+    spread justifies it.
+    """
+    if not text:
+        return None
+    hit = STORAGE_RE.search(normalise(text))
+    if hit is None:
+        return None
+    return f"{hit.group(1)}gb" if hit.group(1) else f"{hit.group(2)}tb"

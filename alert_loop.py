@@ -24,6 +24,10 @@ from wallapop_client import Item, WallapopClient
 
 log = logging.getLogger("alert")
 
+# Only these product families may ever produce a Telegram alert. Everything else
+# in models.REGISTRY is tracked for its comps and nothing more.
+ALERTING_FAMILIES = frozenset({"gpu"})
+
 # How long main(--loop) waits after a failed pass, and the ceiling that wait
 # backs off to. See main() for why a failed pass must not end the process.
 LOOP_BACKOFF_CAP_SECONDS = 15 * 60.0
@@ -68,6 +72,17 @@ def listing_row(item: Item, match: models.Match) -> dict:
         "brand": item.brand,
         "taxonomy": list(item.taxonomy) or None,
         "whole_machine": item.whole_machine,
+        # Family and capacity come from the classification, not the API. family
+        # is what lets a mixed registry be queried safely — "is this row a card
+        # or a handset" — and storage is the biggest price driver within one
+        # iPhone model, captured now so the pools can be split by capacity later
+        # without a backfill that no longer has the titles to parse.
+        "family": match.family if match.model_key else None,
+        "storage": (
+            models.extract_storage(item.title)
+            if match.family == "phone"
+            else None
+        ),
         "posted_at": iso(item.posted_at) if item.posted_at else None,
         "user_allows_shipping": item.user_allows_shipping,
         # The seller id is the only identifier stable across relistings: a
@@ -215,6 +230,7 @@ def run_once() -> dict:
         "blocked_condition": 0,
         "blocked_seller": 0,
         "whole_machine": 0,
+        "non_alerting_family": 0,
         "latency_samples": [],
     }
     telegram = Telegram()
@@ -379,6 +395,23 @@ def run_once() -> dict:
                 if match.priceable and match.model_key
                 else None
             )
+
+            # Families other than 'gpu' are tracked for comps only and must
+            # never be sent. iPhones are in the registry so the bot can learn
+            # what they actually resell for; the owner asked explicitly for the
+            # data without the alerts, and nothing about the margin maths knows
+            # that. No alert search targets a phone, so this should be
+            # unreachable — which is exactly why it is here rather than left
+            # implicit in the seeded search rows. A phone reaching this line
+            # means a search row was added or edited somewhere else, and the
+            # answer to that is still "do not send it".
+            if match.family not in ALERTING_FAMILIES:
+                stats["non_alerting_family"] += 1
+                log.debug(
+                    "skip %s — family %r is comps-only: %s",
+                    item.item_id, match.family, item.title[:40],
+                )
+                continue
 
             # Two caps, and which one applies is exactly the question this loop
             # position exists to answer. With a reference price behind it the
