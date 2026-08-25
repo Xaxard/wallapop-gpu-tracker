@@ -148,10 +148,23 @@ def comp_sane(price: float | None) -> bool:
     alert path keeps MIN_SANE_PRICE. See config.MIN_COMP_PRICE for why the
     owner's literal "exclude anything under 5 EUR" is implemented as 50.
 
-    The upper bound stays MAX_SANE_PRICE: above it a price is a bundle or a typo
-    regardless of which question is being asked.
+    The upper bound is MAX_COMP_PRICE, and it is separate for the same reason
+    the floor is. A 1400 EUR sale is not a trade this bot would ever make, but
+    it is still evidence of what the card is worth — and refusing to learn from
+    it does not make the bot safer, it just leaves the model on its seed guess.
     """
-    return price is not None and config.MIN_COMP_PRICE <= price <= config.MAX_SANE_PRICE
+    return price is not None and config.MIN_COMP_PRICE <= price <= config.MAX_COMP_PRICE
+
+
+def ref_sane(price: float | None) -> bool:
+    """May this be stored as a learned reference price?
+
+    Bounded by the comps pool, not the alert band: a reference is the output of
+    the learning path, so holding it to MAX_SANE_PRICE meant a model whose comps
+    were all legitimately above the alert ceiling could never record what it had
+    learned, and silently kept its seed forever.
+    """
+    return price is not None and config.MIN_COMP_PRICE <= price <= config.MAX_COMP_PRICE
 
 
 # ----------------------------------------------------------- time helpers
@@ -339,7 +352,7 @@ def recompute_model_price(
 
     pairs = _trim_pairs([(c.price, c.weight) for c in comps], config.TRIM_FRACTION)
     raw_ref = weighted_quantile(pairs, config.REF_PERCENTILE)
-    if raw_ref is None or not sane(raw_ref):
+    if raw_ref is None or not ref_sane(raw_ref):
         return None
 
     # Shrink toward a prior instead of the old hard MIN_COMPS cliff (n=4 was
@@ -386,7 +399,7 @@ def recompute_model_price(
     prior_is_seed = prior is not None and bool((existing or {}).get("is_seed", True))
     is_seed = prior_is_seed and n_eff <= config.PRIOR_WEIGHT
 
-    if not sane(ref):
+    if not ref_sane(ref):
         return None
 
     median_days = time_to_sale_days(sold_rows) if sold_rows is not None else (existing or {}).get("median_days_to_sale")

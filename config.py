@@ -313,6 +313,24 @@ MAX_SANE_PRICE = _f("MAX_SANE_PRICE", 1000.0)
 # set MIN_COMP_PRICE=5 to get the literal behaviour.
 MIN_COMP_PRICE = _f("MIN_COMP_PRICE", 50.0)
 
+# Ceiling on a price allowed into the reference-price pool, and on a learned
+# reference itself. Deliberately NOT MAX_SANE_PRICE.
+#
+# These answer different questions, exactly as the floors above already do.
+# MAX_SANE_PRICE asks "could this listing be a trade I act on", and the owner
+# lowered it to 1000 so obvious typos and bundles stop reaching the feed.
+# This one asks "is this a real transaction I can learn a price from", and the
+# answer there is yes far above anything worth buying: knowing an RTX 5080
+# resells for 900 EUR, or an iPhone 17 Pro Max for 1100, is useful even when
+# nothing at that price could ever clear MAX_CAPITAL_PRICE.
+#
+# Coupling them cost real learning. With the pool capped at 1000, every comp
+# above that was dropped and — worse — `recompute_model_price` refused to store
+# any reference over 1000 at all, so the models with the most expensive comps
+# were frozen on their seed guesses permanently. Owner's call on 2026-08-26:
+# let the comps run high, keep the alert ceiling low.
+MAX_COMP_PRICE = _f("MAX_COMP_PRICE", 4000.0)
+
 # How far below the asking price you could realistically negotiate a seller
 # down. A listing qualifies if a haggled offer at this discount would clear the
 # margin gate, even if the raw asking price alone would not — you can always

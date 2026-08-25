@@ -341,7 +341,33 @@ def test_comp_sane_reads_min_comp_price_not_min_sane_price(monkeypatch):
     assert pricing.sane(100.0)
     assert pricing.comp_sane(120.0)
     assert not pricing.comp_sane(None)
-    assert not pricing.comp_sane(config.MAX_SANE_PRICE + 1)
+    assert not pricing.comp_sane(config.MAX_COMP_PRICE + 1)
+
+
+def test_the_pool_ceiling_is_separate_from_the_alert_ceiling():
+    """The ceilings are separate for the same reason the floors are, and this is
+    the case that motivated it: with MAX_SANE_PRICE lowered to 1000, a 1400 EUR
+    sale is not something to alert on but is still evidence of what the card is
+    worth. Coupling them froze the priciest models on their seed guesses."""
+    assert config.MAX_COMP_PRICE > config.MAX_SANE_PRICE
+    dear = config.MAX_SANE_PRICE + 400
+    assert not pricing.sane(dear)        # never a trade
+    assert pricing.comp_sane(dear)       # still a lesson
+    assert pricing.ref_sane(dear)        # and it can be stored
+
+
+def test_a_reference_above_the_alert_ceiling_is_still_learned(monkeypatch):
+    """recompute_model_price used to refuse any reference over MAX_SANE_PRICE,
+    so a model whose comps all sat above the alert ceiling could never record
+    what it had learned."""
+    monkeypatch.setattr(pricing, "_time_decay", lambda age: 1.0)
+    reserved = [_reserved_row(f"r{i}", 1400.0) for i in range(12)]
+    db = _FakeDB(reserved=reserved)
+
+    row = pricing.recompute_model_price(db, "rtx_5080", {"ref_price": 1400.0, "is_seed": False})
+
+    assert row is not None, "a legitimately expensive model must still learn"
+    assert row["ref_price"] > config.MAX_SANE_PRICE
 
 
 @pytest.mark.parametrize("price,admitted", [
