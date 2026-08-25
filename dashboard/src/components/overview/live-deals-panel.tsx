@@ -24,8 +24,8 @@ export function LiveDealsPanel({
   const truncationNotice = truncated ? (
     <p className="border-t py-2 text-xs text-destructive">
       Showing deals from the {scanned.toLocaleString()} cheapest of{" "}
-      {candidates.toLocaleString()} active listings under the price cap — the scan limit was
-      reached, so this list may be incomplete. Raise MAX_SCAN_ROWS in
+      {candidates.toLocaleString()} in-scope active listings under the price cap — the scan
+      limit was reached, so this list may be incomplete. Raise MAX_SCAN_ROWS in
       src/lib/queries.ts.
     </p>
   ) : null;

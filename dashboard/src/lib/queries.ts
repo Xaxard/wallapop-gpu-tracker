@@ -1,11 +1,13 @@
 import "server-only";
 import { supabaseAdmin } from "@/lib/supabase/server";
 import {
+  ALERTING_FAMILIES,
   MAX_CAPITAL_PRICE,
   MAX_SANE_PRICE,
   MIN_SANE_PRICE,
   confidenceForRow,
   evaluateDeal,
+  inAlertScope,
   netInPerson,
   netShipped,
 } from "@/lib/constants";
@@ -140,6 +142,16 @@ async function modelPricesByKey(modelKeys: string[]): Promise<Map<string, ModelP
  * price, and expressing it in SQL would mean a third copy of the fee model in a
  * place even harder to keep in step than `constants.ts` already is. The join is
  * one query for ~60 `model_prices` rows instead.
+ *
+ * "Clears the margin gate" is necessary but not sufficient, and that was a real
+ * bug here: `listings` holds every row *both* loops write, and the comps loop
+ * writes rows the tracker would never trade — iPhones (tracked for their comps
+ * since the registry gained them, and barred from alerting by
+ * `alert_loop.ALERTING_FAMILIES`), prebuilts and laptops, blocked sellers,
+ * bottom-tier condition. All of them clear a margin gate that knows nothing
+ * about any of that, so all of them were being listed as live deals. The two
+ * cheap, indexed rejections are pushed into the query so they don't burn
+ * MAX_SCAN_ROWS; the rest go through `inAlertScope`.
  */
 export async function getLiveDeals(): Promise<LiveDealsResult> {
   const db = supabaseAdmin();
@@ -152,6 +164,14 @@ export async function getLiveDeals(): Promise<LiveDealsResult> {
   // report the loss.
   const priceCeiling = Math.min(MAX_CAPITAL_PRICE, MAX_SANE_PRICE);
 
+  // Both scope filters are written to tolerate a null, and have to be: `family`
+  // is a recent column, and a row that predates it is a GPU, not a handset. A
+  // bare `.eq("family", "gpu")` would drop every listing written before the
+  // column existed — enforcing a rule aimed at phones by hiding real deals.
+  // `whole_machine` is `not null default false` in schema.sql, but only after
+  // its migration has been applied, so the same care is taken there.
+  const alertingFamilies = [...ALERTING_FAMILIES].join(",");
+
   const { rows, total, truncated } = await fetchAllPaged<ListingRow>((from, to, withCount) =>
     db
       .from("listings")
@@ -160,6 +180,8 @@ export async function getLiveDeals(): Promise<LiveDealsResult> {
       .not("model_key", "is", null)
       .gte("last_price", MIN_SANE_PRICE)
       .lte("last_price", priceCeiling)
+      .or(`family.is.null,family.in.(${alertingFamilies})`)
+      .or("whole_machine.is.null,whole_machine.eq.false")
       .order("last_price", { ascending: true })
       .range(from, to),
   );
@@ -168,6 +190,10 @@ export async function getLiveDeals(): Promise<LiveDealsResult> {
 
   const deals: LiveDeal[] = [];
   for (const listing of rows) {
+    // The rejections the query couldn't express (blocked seller, blocked
+    // condition), plus a belt-and-braces re-check of the two it could.
+    if (!inAlertScope(listing)) continue;
+
     const mp = listing.model_key ? prices.get(listing.model_key) : undefined;
     const verdict = evaluateDeal(listing.last_price, mp);
     if (!verdict.qualifies) continue;

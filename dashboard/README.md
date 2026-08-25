@@ -7,11 +7,13 @@ five views: Overview, Deals & Alerts, Models, Listings, and Searches & Junk.
 
 The only write in the whole app is toggling `searches.active`.
 
-It re-implements exactly one piece of tracker logic — the fee model and deal
-gate, in `src/lib/constants.ts` — because those numbers are needed to render a
-margin and are not persisted anywhere the dashboard can read them. That port is
-the app's main maintenance hazard; see
-[Fee model](#fee-model-must-match-the-tracker).
+It re-implements two pieces of tracker logic, both in `src/lib/constants.ts`:
+the fee model and deal gate (`config.py`'s `FeeModel` + `pricing.evaluate`),
+because those numbers are needed to render a margin and are not persisted
+anywhere the dashboard can read them; and the scope rejections `alert_loop`
+applies before a listing is ever evaluated. That port is the app's main
+maintenance hazard; see [Fee model](#fee-model-must-match-the-tracker) and
+[Alert scope](#alert-scope-a-margin-is-not-enough).
 
 ## Stack
 
@@ -36,8 +38,9 @@ Fill in:
 - `DASHBOARD_PASSWORD` / `SESSION_SECRET` — **both required**; see
   [Authentication](#authentication) below. Without them the app serves 503 on
   every route.
-- The fee-model constants — **these must match what the tracker is actually
-  running with**, not just the defaults here. Check the tracker's own
+- The fee-model constants, and the alert-scope constants (`ALERTING_FAMILIES`,
+  `BLOCKED_CONDITIONS`, `BLOCKED_SELLERS`) — **these must match what the
+  tracker is actually running with**, not just the defaults here. Check the tracker's own
   `.env.local` / deployed env before you rely on any net-margin figure or deal
   in this dashboard. See [Fee model](#fee-model-must-match-the-tracker).
 
@@ -106,6 +109,18 @@ Variables) — they won't be picked up from `.env.local`.
   full, in pages. If the `MAX_SCAN_ROWS` safety bound in `src/lib/queries.ts`
   is ever hit, the Overview panel says the list may be incomplete rather than
   quietly dropping rows.
+- **The deal list applies the tracker's scope rejections, not just its margin
+  gate.** `listings` holds every row *both* loops write, and the comps loop
+  writes plenty the tracker would never trade. Clearing the margin gate was
+  therefore necessary but nowhere near sufficient, and the gap was not
+  academic: measured against the live database, 220 listings were being shown
+  as live deals and only 37 of them were ones the bot would actually alert on.
+  The other 183 were almost all iPhones — 1,043 of the 1,354 candidate rows are
+  handsets, tracked for their comps since the registry gained them and barred
+  from alerting by `alert_loop.ALERTING_FAMILIES`. Family, whole machines,
+  blocked sellers and blocked conditions are all recorded on the `listings`
+  row, so these are applied exactly rather than approximated. See
+  [Alert scope](#alert-scope-a-margin-is-not-enough).
 - Soft caps on a few queries (alerts, junk log, listings) keep the personal-
   scale dataset this is built for fast; raise them in `src/lib/queries.ts`
   if the tracker runs long enough to need it.
@@ -184,6 +199,42 @@ The real fix is for the tracker to persist or expose these numbers so there is
 one source of truth. Until then, check both environments whenever either
 changes.
 
+## Alert scope: a margin is not enough
+
+`pricing.evaluate()` is not the only gate the tracker applies, and porting only
+that function is how this dashboard spent a long time disagreeing with the
+Telegram feed about what a deal is. Before a listing reaches `evaluate()`,
+`alert_loop`'s candidate loop rejects four classes of listing outright:
+
+| Rejection | Tracker | `listings` column |
+| --- | --- | --- |
+| Non-alerting family | `alert_loop.ALERTING_FAMILIES` | `family` |
+| Whole machines (prebuilts, laptops) | `item.whole_machine` | `whole_machine` |
+| Blocked sellers | `config.BLOCKED_SELLERS` | `seller_id` |
+| Bottom condition tier | `config.BLOCKED_CONDITIONS` | `condition` |
+
+None of these live in `pricing.py`, and none of them are visible to margin
+maths — a 300 EUR iPhone against a 415 EUR reference clears a buy ceiling just
+as cleanly as a graphics card does. The comps loop writes those rows *on
+purpose*: iPhone 15–17 are in the registry so the tracker can learn what they
+resell for, which the owner asked for as data without alerts. They are input to
+the pricing engine, never candidates for a trade.
+
+`alertScopeRejection()` in `src/lib/constants.ts` is the port, and
+`getLiveDeals` applies it. Two of the four are pushed into PostgREST so they
+don't burn `MAX_SCAN_ROWS`; all four are re-checked in JavaScript.
+
+Every check needs *positive* evidence to reject, which matters more than it
+looks: `family` is a recent column, so a GPU row written before it existed
+carries null. A bare `family = 'gpu'` filter would enforce a rule aimed at
+handsets by silently hiding real deals — the same shape of bug as the one it
+was written to fix.
+
+Three env vars keep this in step with the tracker — `ALERTING_FAMILIES`,
+`BLOCKED_CONDITIONS`, `BLOCKED_SELLERS`. `BLOCKED_SELLERS` is the one that will
+drift in practice, since it grows whenever a replica seller is spotted; a seller
+worth blocking from the alert feed is one worth hiding here.
+
 ## Outstanding operational tasks
 
 - **Rotate `SUPABASE_SERVICE_ROLE_KEY` if this dashboard was ever deployed
@@ -195,12 +246,9 @@ changes.
   it was too. Rotate in Supabase (Project Settings → API → service_role →
   rotate), then update the env var in both Vercel and the tracker's own
   environment, since they share the project.
-- **This app is not in version control yet.** `git status` in the parent repo
-  shows `?? dashboard/` — it exists only on this machine and in whatever Vercel
-  last built. `.gitignore` has been verified to exclude `.env*` (with an
-  explicit `!.env.example` negation so the template can be tracked) and
-  `.vercel`, so committing is safe; a dry run of `git add dashboard/` stages
-  source, docs and `.env.example` only. Committing is a manual step for the
-  owner.
+- ~~This app is not in version control yet.~~ **Done** — `dashboard/` is
+  tracked in the parent repo (86 files as of this writing) and the working tree
+  is clean. `.gitignore` excludes `.env*`, with an explicit `!.env.example`
+  negation so the template stays tracked, and `.vercel`.
 - **Apply `supabase-views.sql`** in the Supabase SQL editor when convenient.
   Optional — see step 2 of Setup.

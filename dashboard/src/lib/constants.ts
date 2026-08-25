@@ -21,10 +21,15 @@
  *   TARGET_MARGIN  MARGIN_RATE  SEED_MARGIN_MULTIPLIER
  *   OFFER_DISCOUNT  MIN_PLAUSIBLE_RATIO
  *   MIN_SANE_PRICE  MAX_SANE_PRICE  MAX_DEAL_PRICE  MAX_CAPITAL_PRICE
+ *   BLOCKED_CONDITIONS  BLOCKED_SELLERS  ALERTING_FAMILIES
  *
  * The defaults below mirror config.py's defaults, with one exception noted at
  * SELLER_FEE. Defaults are a starting point, not a guarantee — check the
  * tracker's live env before trusting any figure this dashboard renders.
+ *
+ * A second section at the foot of this file ports `alert_loop`'s scope
+ * rejections, which are *not* in `pricing.evaluate()` and were missing here
+ * entirely — see the header on `alertScopeRejection`.
  */
 
 function num(name: string, fallback: number): number {
@@ -343,4 +348,100 @@ export function evaluateDeal(price: number | null, model: PricedModel | undefine
     ceilingInPerson: ceilingInPersonValue,
     offer,
   };
+}
+
+// ------------------------------------------------------------ alert scope
+
+/**
+ * ==========================================================================
+ *  PORT OF alert_loop.py's SCOPE REJECTIONS. Keep in step with its candidate
+ *  loop, not just with pricing.evaluate().
+ * ==========================================================================
+ *
+ * `evaluateDeal` above is a faithful port of `pricing.evaluate()` — and that
+ * was the whole problem, because `evaluate()` is not the only gate the tracker
+ * applies. Before a listing is ever handed to it, `alert_loop` throws out four
+ * classes of listing outright, and none of those rejections live in
+ * `pricing.py` where this file was looking:
+ *
+ *   1. families other than 'gpu'        (ALERTING_FAMILIES)
+ *   2. whole machines                   (item.whole_machine)
+ *   3. blocked sellers                  (config.BLOCKED_SELLERS)
+ *   4. the bottom condition tier        (config.BLOCKED_CONDITIONS)
+ *
+ * All four are recorded on the `listings` row, so the dashboard can apply them
+ * exactly rather than approximating. Without them the deal list is strictly
+ * wider than the alert feed and disagrees with it about what a deal is, which
+ * is the same class of bug as the fee-model drift documented at the top of this
+ * file — just arriving through a different door.
+ *
+ * The comps loop writes `listings` rows for everything it sees, phones and
+ * prebuilts included, precisely so their prices can inform the model. Those
+ * rows are data for the pricing engine, never candidates for a trade.
+ */
+
+/** `alert_loop.ALERTING_FAMILIES`. Everything else in `models.REGISTRY` — the
+ *  iPhone 15/16/17 rows — is tracked for its comps and nothing more.
+ *
+ *  Applied as a denylist rather than an allowlist on purpose: `family` is a
+ *  recent column, so a GPU row written before it existed carries null, and
+ *  requiring `family = 'gpu'` would hide real deals to enforce a rule aimed at
+ *  handsets. The tracker never sees a null here (`models.Match.family` defaults
+ *  to 'gpu'), so null means "written before the column" and is a GPU. */
+export const ALERTING_FAMILIES = new Set(
+  (process.env.ALERTING_FAMILIES ?? "gpu").split(",").map((f) => f.trim()).filter(Boolean),
+);
+
+/** `config.BLOCKED_CONDITIONS`. Only the bottom tier is blocked: `fair`
+ *  deliberately stays, because a cosmetic flaw on a working card is exactly the
+ *  discount a flip is built on. */
+export const BLOCKED_CONDITIONS = new Set(
+  (process.env.BLOCKED_CONDITIONS ?? "has_given_it_all")
+    .split(",")
+    .map((c) => c.trim())
+    .filter(Boolean),
+);
+
+/** `config.BLOCKED_SELLERS`. Empty by default. The same replica or empty-box
+ *  listing reappears under a fresh `item_id` every few days, which defeats the
+ *  (item_id, price) alert dedup completely; the seller is the only identifier
+ *  that survives a relisting. */
+export const BLOCKED_SELLERS = new Set(
+  (process.env.BLOCKED_SELLERS ?? "").split(",").map((s) => s.trim()).filter(Boolean),
+);
+
+/** The subset of a `listings` row the scope rejections need. */
+export interface ScopedListing {
+  family?: string | null;
+  whole_machine?: boolean | null;
+  condition?: string | null;
+  seller_id?: string | null;
+}
+
+/**
+ * Would `alert_loop` even consider this listing, before any margin maths?
+ *
+ * Returns null when the listing is in scope, or the reason it was rejected —
+ * in `alert_loop`'s own order, so a listing you expected on the page can be
+ * traced to the same rejection the tracker logged.
+ *
+ * Null-tolerant throughout: each rejection needs positive evidence. A row
+ * predating one of these columns must not be dropped on the strength of a
+ * column that was never written.
+ */
+export function alertScopeRejection(listing: ScopedListing): string | null {
+  if (listing.whole_machine === true) return "whole machine";
+  if (listing.seller_id && BLOCKED_SELLERS.has(listing.seller_id)) return "blocked seller";
+  if (listing.family && !ALERTING_FAMILIES.has(listing.family)) {
+    return `family ${listing.family} is comps-only`;
+  }
+  if (listing.condition && BLOCKED_CONDITIONS.has(listing.condition)) {
+    return `condition ${listing.condition}`;
+  }
+  return null;
+}
+
+/** Convenience wrapper: true when the tracker would consider this listing. */
+export function inAlertScope(listing: ScopedListing): boolean {
+  return alertScopeRejection(listing) === null;
 }
