@@ -67,11 +67,15 @@ DISCOVERY_SEARCHES = [
 # variants get their own searches so their prices never contaminate the base
 # model's median.
 # Every model in SEED_PRICES needs one, otherwise it can never learn a real
-# reference price and stays pinned to its seed forever. The high-end cards are
-# included even though nothing near their market value could ever clear
-# MAX_CAPITAL_PRICE: the whole point is that a 4090 listed at 340 EUR is the
-# best possible outcome, and recognising that requires knowing what a 4090 is
-# worth.
+# reference price and stays pinned to its seed forever.
+#
+# The RTX 4090 and 5090 were removed from the registry entirely on 2026-08-26.
+# They were kept for a while on the argument that a 4090 listed at 340 EUR is
+# the best possible outcome and recognising it requires knowing what a 4090 is
+# worth — but MIN_PLAUSIBLE_RATIO now rejects exactly that listing as
+# implausible, and their references sit above MAX_CAPITAL_PRICE / the ratio, so
+# no price could ever alert. Tracking them was pure cost: two comps searches an
+# hour for a card the bot could never act on.
 COMPS_MODELS = [
     ("rtx_3050", "rtx 3050"),
     ("rtx_3060", "rtx 3060"),
@@ -89,13 +93,11 @@ COMPS_MODELS = [
     ("rtx_4070_ti_super", "rtx 4070 ti super"),
     ("rtx_4080", "rtx 4080"),
     ("rtx_4080_super", "rtx 4080 super"),
-    ("rtx_4090", "rtx 4090"),
     ("rtx_5060", "rtx 5060"),
     ("rtx_5060_ti", "rtx 5060 ti"),
     ("rtx_5070", "rtx 5070"),
     ("rtx_5070_ti", "rtx 5070 ti"),
     ("rtx_5080", "rtx 5080"),
-    ("rtx_5090", "rtx 5090"),
     ("rx_6600", "rx 6600"),
     ("rx_6600_xt", "rx 6600 xt"),
     ("rx_6650_xt", "rx 6650 xt"),
@@ -193,7 +195,6 @@ SEED_PRICES = {
     "rtx_4070_ti_super": 520,
     "rtx_4080": 620,
     "rtx_4080_super": 650,
-    "rtx_4090": 1200,
     "rtx_5060": 260,
     "rtx_5060_ti": 350,
     "rtx_5060_ti_8g": 320,
@@ -208,7 +209,6 @@ SEED_PRICES = {
     "rtx_3080_12g": 310,
     "rtx_3090_ti": 520,
     "rtx_5080": 900,
-    "rtx_5090": 1800,
     "rx_6600": 130,
     "rx_6600_xt": 150,
     "rx_6650_xt": 165,

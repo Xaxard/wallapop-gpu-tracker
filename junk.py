@@ -117,6 +117,67 @@ LAPTOP_PHRASES = (
 # "microprocesador" only ever show up when the product itself is a CPU.
 CPU_TOKENS = ("procesador", "microprocesador")
 
+# Desktop CPU model numbers, which collide with Radeon numbers head-on: a
+# "Ryzen 5 7600X" is a processor and an "RX 7600 XT" is a graphics card, and the
+# digits are identical.
+#
+# CPU_TOKENS above was documented as the defence for this and is not: it only
+# fires on the literal words "procesador"/"microprocesador", and the laptop
+# regex below only catches *mobile* chips (the h/hs/hx suffixes). A plain
+# "AMD Ryzen 5 7600X" hit neither, matched \b7600\b, and — because "amd" is a
+# valid AMD brand token — classified as an RX 7600 at *high* confidence,
+# priceable, against a ~200 EUR reference. Verified live on 2026-08-26.
+#
+# Kept narrow in two ways, because the original comment's caution still stands
+# ("ideal para Ryzen 5000" is a real GPU listing):
+#   * the number must have a CPU's shape — 4-5 digits (Ryzen 7600, Intel
+#     12400) with an optional x/x3d/g/k/f
+#     suffix — so a bare series like "ryzen 5000" does not match;
+#   * it is skipped entirely when the title also names a GPU vendor, so
+#     "RX 6700 compatible con Ryzen 7 5800X" survives.
+DESKTOP_CPU_RX = re.compile(
+    r"\b(?:ryzen\s*[3579]|i\s*[3579])\s*\d{4,5}\s*(?:x3d|xt|x|g|ge|k|kf|kd|f)?\b"
+)
+
+# GPU vendor words that make a CPU model number incidental rather than the
+# product. Deliberately excludes bare "amd", which is exactly what a Ryzen box
+# says.
+GPU_VENDOR_TOKENS = ("rtx", "gtx", "geforce", "radeon", "rx", "nvidia")
+
+# Other PC components sold on the same searches. None of these are graphics
+# cards, and none were being filtered — "Placa base B550", "Disco duro SSD 1TB"
+# and "Pack cables PSU" all reached the bootstrap alert path clean, where a
+# keyword match and a price under the cap is the whole test.
+#
+# Title-only, and skipped when the title opens by naming a card, for the same
+# reason the laptop rules are: a graphics card listing may legitimately mention
+# these in passing ("RTX 3080 con disipador nuevo", "incluyo disco duro").
+# Matching them against the description would reject real cards for describing
+# what comes in the box.
+COMPONENT_TOKENS = (
+    "placa",          # "placa base"
+    "disipador",
+    "ssd",
+    "nvme",
+    "disco",
+)
+
+COMPONENT_PHRASES = (
+    "placa base",
+    "disco duro",
+    "pack cables",
+    "bloque refrigeracion",
+    "refrigeracion liquida",
+    # A 2006 GeForce, not a Radeon RX 7600. The rival-vendor rule in models.py
+    # already drops "Nvidia 7600GS" to low confidence; this stops it earlier and
+    # covers the variant that names no vendor at all. normalise() splits the
+    # letter/digit boundary, so the stored phrase is "7600 gs".
+    "7600 gs",
+    # Old Radeon, out of the tracked registry entirely.
+    "vega rx",
+    "rx vega",
+)
+
 # Phone accessories and services, not phones. These are the dominant noise on
 # any iPhone search: a "Funda iPhone 15" at 8 EUR against a 700 EUR reference is
 # a 99% margin by the maths and pure junk in reality — it is the listing named
@@ -235,6 +296,7 @@ _PHRASE_GROUPS_RX = tuple(
 _BUNDLE_RX = _compile(BUNDLE)
 _PHONE_NOT_A_PHONE_RX = _compile(PHONE_NOT_A_PHONE)
 _LAPTOP_PHRASES_RX = _compile(LAPTOP_PHRASES)
+_COMPONENT_PHRASES_RX = _compile(COMPONENT_PHRASES)
 
 
 def _first_hit(
@@ -302,6 +364,10 @@ def check(title: str | None, description: str | None = None) -> JunkVerdict:
         for token in CPU_TOKENS:
             if token in tokens:
                 return JunkVerdict(True, token, "CPU")
+        if not any(v in tokens for v in GPU_VENDOR_TOKENS):
+            cpu_hit = DESKTOP_CPU_RX.search(norm_title)
+            if cpu_hit:
+                return JunkVerdict(True, cpu_hit.group(0), "CPU")
         for token in LAPTOP_TOKENS:
             if token in tokens:
                 return JunkVerdict(True, token, "LAPTOP")
@@ -312,6 +378,13 @@ def check(title: str | None, description: str | None = None) -> JunkVerdict:
             hit = rx.search(norm_title)
             if hit:
                 return JunkVerdict(True, hit.group(0), "LAPTOP")
+
+        for token in COMPONENT_TOKENS:
+            if token in tokens:
+                return JunkVerdict(True, token, "COMPONENT")
+        hit = _first_hit(norm_title, _COMPONENT_PHRASES_RX)
+        if hit:
+            return JunkVerdict(True, hit, "COMPONENT")
 
     return _shared_rules(norm_title, haystack)
 

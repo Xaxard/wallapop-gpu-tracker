@@ -91,28 +91,29 @@ export const OFFER_DISCOUNT = num("OFFER_DISCOUNT", 0.2);
  * config.py: `MIN_PLAUSIBLE_RATIO`. Floor on how far below the reference a
  * listing may sit, as a fraction of ref_price.
  *
- * DISABLED (0) BY OWNER DECISION — must stay in step with config.py, which is
- * also 0. Do not "fix" this back to 0.35 to match the old comment above.
+ * RE-ENABLED AT 0.65 (2026-08-26) — must stay in step with config.py, which is
+ * also 0.65. This setting has moved three times; see config.py for the full
+ * history and the numbers behind each move.
  *
- * It was 0.35 and it was the guard against the margin engine's one structural
- * blind spot: the more absurd a price, the better the margin it computes, so
- * replicas and empty boxes sort straight to the top of a list ranked by margin
- * — and this list is ranked by margin. It came off anyway, because the guard is
- * symmetric and cannot tell a scam from a genuine steal, and the owner would
- * rather judge legitimacy from the listing than lose the best finds to a filter.
+ * It guards the margin engine's one structural blind spot: the more absurd a
+ * price, the better the margin it computes, so replicas and empty boxes sort
+ * straight to the top of a list ranked by margin — and this list is ranked by
+ * margin. It was off for a while, because the guard is symmetric and cannot
+ * tell a scam from a genuine steal; live experience reversed that, and it is
+ * now set higher than it has ever been.
  *
- * The practical consequence here is sharper than in the tracker: a Telegram
- * alert is one message a person reads, while this list is sorted worst-price-
- * first by construction. Fakes will now appear at the top. MIN_SANE_PRICE (50)
- * is the only remaining lower bound.
+ * At 0.65 this is a load-bearing filter, not a long tail: it rejects any
+ * listing asking less than 65% of the reference before any margin maths runs.
+ * Expect the deal list to be markedly shorter, and expect it to be missing some
+ * genuine bargains along with the fakes.
  */
-export const MIN_PLAUSIBLE_RATIO = num("MIN_PLAUSIBLE_RATIO", 0);
+export const MIN_PLAUSIBLE_RATIO = num("MIN_PLAUSIBLE_RATIO", 0.65);
 
 /** config.py: `MIN_SANE_PRICE` / `MAX_SANE_PRICE`. `pricing.evaluate` rejects
  *  anything outside this band before doing any margin maths at all. A GPU under
  *  50 EUR is a dead card, a replica or bait, never a flip. */
 export const MIN_SANE_PRICE = num("MIN_SANE_PRICE", 50);
-export const MAX_SANE_PRICE = num("MAX_SANE_PRICE", 4000);
+export const MAX_SANE_PRICE = num("MAX_SANE_PRICE", 1000);
 
 /**
  * config.py: `MAX_ALERT_PRICE` (named MAX_DEAL_PRICE here for continuity with
@@ -125,7 +126,7 @@ export const MAX_SANE_PRICE = num("MAX_SANE_PRICE", 4000);
  * `evaluateDeal`). It is kept because the env var predates the split and other
  * callers still read it.
  */
-export const MAX_DEAL_PRICE = num("MAX_DEAL_PRICE", 350);
+export const MAX_DEAL_PRICE = num("MAX_DEAL_PRICE", 450);
 
 /**
  * config.py: `MAX_CAPITAL_PRICE`. The cap for listings that *do* have a
@@ -133,13 +134,16 @@ export const MAX_DEAL_PRICE = num("MAX_DEAL_PRICE", 350);
  *
  * `alert_loop` applies the flat MAX_ALERT_PRICE only on the bootstrap path now.
  * Once a model has a reference the margin gate is a real test, so the only
- * remaining job for a cap is bounding capital at risk on one purchase, and it
- * sits much higher. A 4080 at 420 EUR against a 620 EUR reference clears a
- * ~468 EUR ceiling and is a better trade than anything 350 admitted; capping
- * the dashboard at 350 would hide exactly the deals the tracker was changed to
- * find.
+ * remaining job for a cap is bounding capital at risk on one purchase.
+ *
+ * Lowered 700 -> 500 on 2026-08-26. Note the interaction with
+ * MIN_PLAUSIBLE_RATIO: the floor is a fraction of the reference and this is a
+ * flat number, so above a reference of MAX_CAPITAL_PRICE / MIN_PLAUSIBLE_RATIO
+ * (~769 EUR at these values) the floor rises above the cap and the model can
+ * never qualify at any price. The RTX 4090 and 5090 were dropped from the
+ * tracker for exactly this reason.
  */
-export const MAX_CAPITAL_PRICE = num("MAX_CAPITAL_PRICE", 700);
+export const MAX_CAPITAL_PRICE = num("MAX_CAPITAL_PRICE", 500);
 
 /** config.py: `MIN_COMPS`. Below this many comps the tracker won't replace a
  *  seed price, so the dashboard calls the model low-confidence. */

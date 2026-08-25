@@ -410,7 +410,12 @@ def test_shrinkage_pulls_hard_toward_prior_with_few_comps(monkeypatch):
     assert row["shrunk"] is True
     # n_eff is the *trimmed* pool's weight — trimming drops k from each end
     # first (k=1 here, per the dead-zone fix), so only 3 of the 5 comps feed it.
+    # Mirror _trim_pairs exactly, including its `n - 2k >= 3` safety guard:
+    # below that it declines to trim at all. At MIN_COMPS=3 the guard always
+    # bites, so a three-comp reference gets NO outlier trimming whatsoever.
     k = pricing._trim_k(config.MIN_COMPS, config.TRIM_FRACTION)
+    if not (k and config.MIN_COMPS - 2 * k >= 3):
+        k = 0
     n_eff = (config.MIN_COMPS - 2 * k) * config.RESERVED_WEIGHT
     expected = (n_eff * 300.0 + config.PRIOR_WEIGHT * 500.0) / (n_eff + config.PRIOR_WEIGHT)
     assert row["ref_price"] == pytest.approx(round(expected, 2))
@@ -690,7 +695,9 @@ def test_evaluate_gates_on_the_offer_price_not_the_asking_price(monkeypatch):
     """
     monkeypatch.setattr(config, "OFFER_DISCOUNT", 0.20)
     row = {"ref_price": 330, "buy_ceiling": 224.0, "buy_ceiling_in_person": 280.0, "n_comps": 12}
-    assert pricing.evaluate(210, row, None).qualifies       # offer 168 <= 224
+    # 220, not 210: MIN_PLAUSIBLE_RATIO is 0.65 now, so 0.65*330 = 214.50 is the
+    # floor and a 210 asking price is rejected before the offer gate is reached.
+    assert pricing.evaluate(220, row, None).qualifies       # offer 176 <= 224
     assert pricing.evaluate(250, row, None).qualifies       # offer 200 <= 224 — rescued by haggling
     assert not pricing.evaluate(290, row, None).qualifies   # offer 232 > 224 — still too rich
 
@@ -906,11 +913,30 @@ def test_cpu_listings_are_excluded(title):
     assert verdict.excluded and verdict.category == "CPU"
 
 
-def test_bare_ryzen_mention_does_not_exclude():
-    """'ryzen' alone isn't in CPU_TOKENS — a title naming it without
-    "procesador" isn't confidently a CPU listing, and being too strict here
-    risks dropping real GPU deals."""
-    assert not junk.check("AMD Ryzen 7 7700X sin usar").excluded
+def test_desktop_cpu_model_numbers_are_excluded():
+    """Ryzen and Radeon model numbers collide exactly ("Ryzen 5 7600" vs
+    "RX 7600"), and "amd" is a valid AMD brand token, so an unfiltered
+    "AMD Ryzen 5 7600X" classified as an RX 7600 at *high* confidence and got
+    priced against a ~200 EUR reference. Verified live 2026-08-26."""
+    for title in (
+        "AMD Ryzen 7 7700X sin usar",
+        "AMD Ryzen 5 7600X",
+        "Ryzen 5 7600",
+        "Intel i5 12400F",
+        "Intel Core i9 13900K",
+    ):
+        assert junk.check(title).excluded, title
+
+
+def test_a_gpu_title_naming_a_cpu_still_survives():
+    """The rule is skipped when the title names a GPU vendor, so a card sold
+    as compatible with a processor is not mistaken for one."""
+    for title in (
+        "RX 6700 XT compatible con Ryzen 7 5800X",
+        "RTX 4070 ideal para Ryzen 5 7600",
+        "Tarjeta grafica RTX 4070 ideal para Ryzen 5000",
+    ):
+        assert not junk.check(title).excluded, title
 
 
 def test_card_mentioning_a_compatible_cpu_survives():
@@ -945,8 +971,13 @@ def test_seeded_models_demand_more_margin_than_learned_ones():
 
 def test_a_genuine_bargain_still_gets_through_a_seed_price():
     """The penalty raises the bar, it does not close the door — otherwise a
-    brand-new model could never produce its first alert."""
-    seeded = pricing.evaluate(300.0, _row(560.0, is_seed=True), None)
+    brand-new model could never produce its first alert.
+
+    Note how narrow the door has become. On a seeded 560 EUR reference the
+    plausibility floor puts the bottom at 364 EUR and the seed-penalised ceiling
+    puts the top at ~457 EUR, so a first alert has to land in a ~93 EUR window.
+    """
+    seeded = pricing.evaluate(400.0, _row(560.0, is_seed=True), None)
     assert seeded.qualifies
 
 
@@ -955,30 +986,27 @@ def test_seed_penalty_can_be_disabled(monkeypatch):
     assert pricing.evaluate(500.0, _row(560.0, is_seed=True), None).qualifies
 
 
-def test_an_extremely_cheap_listing_still_qualifies():
-    """MIN_PLAUSIBLE_RATIO is disabled by owner decision, for every model — it
-    is one global ratio, not a per-card setting, so this holds across the whole
-    registry. The margin engine is structurally blind to fakes and this used to
-    be the compensating guard; it was removed because it could not distinguish a
-    replica from a genuine steal, and the owner would rather judge that from the
-    listing itself than lose the best finds to a filter."""
-    deal = pricing.evaluate(150.0, _row(700.0, is_seed=False), None)
-    assert deal.qualifies
-    assert deal.ref_price == 700.0
-
-
-def test_the_sanity_floor_is_now_the_only_lower_bound():
-    """With the plausibility ratio off, MIN_SANE_PRICE is all that stands
-    between the feed and a 20 EUR listing claiming to be a 700 EUR card."""
-    assert not pricing.evaluate(49.0, _row(700.0, is_seed=False), None).qualifies
-    assert pricing.evaluate(50.0, _row(700.0, is_seed=False), None).qualifies
-
-
-def test_disabling_the_ratio_is_a_choice_not_an_accident(monkeypatch):
-    """Guards the two tests above from silently becoming vacuous: the gate is
-    still wired up and still works, it is the *default* that was changed. Set
-    the ratio and the old rejection comes straight back."""
-    monkeypatch.setattr(pricing.config, "MIN_PLAUSIBLE_RATIO", 0.35)
+def test_an_extremely_cheap_listing_is_now_rejected():
+    """MIN_PLAUSIBLE_RATIO is 0.65 since 2026-08-26, reversing the earlier
+    decision to disable it. A 150 EUR listing against a 700 EUR reference is
+    exactly the shape this guard exists for — and exactly the shape of a genuine
+    drawer-clearing steal, which is the price of having it on."""
     deal = pricing.evaluate(150.0, _row(700.0, is_seed=False), None)
     assert not deal.qualifies
     assert "implausibly cheap" in deal.reason
+    assert deal.ref_price == 700.0
+
+
+def test_the_plausibility_floor_is_the_binding_lower_bound():
+    """MIN_SANE_PRICE (50) is no longer what stops a cheap listing — the ratio
+    is, and it bites far higher. On a 700 EUR reference the floor is 455 EUR, so
+    everything from 50 to 454 is now rejected without being evaluated."""
+    assert not pricing.evaluate(454.0, _row(700.0, is_seed=False), None).qualifies
+    assert pricing.evaluate(455.0, _row(700.0, is_seed=False), None).qualifies
+
+
+def test_the_ratio_is_a_setting_not_a_hardcoded_rule(monkeypatch):
+    """Guards the two tests above from silently becoming vacuous: the gate reads
+    the config value, so setting it back to 0 restores the old behaviour."""
+    monkeypatch.setattr(pricing.config, "MIN_PLAUSIBLE_RATIO", 0.0)
+    assert pricing.evaluate(150.0, _row(700.0, is_seed=False), None).qualifies

@@ -14,7 +14,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import alert_loop  # noqa: E402
 import comps_loop  # noqa: E402
-import config  # noqa: E402
+import config
+import pricing  # noqa: E402
 import seed  # noqa: E402
 from wallapop_client import Item  # noqa: E402
 
@@ -284,13 +285,13 @@ def wire(monkeypatch):
 # ------------------------------------------------------------------ alerts
 def test_cheap_card_alerts_and_is_recorded(wire):
     db = FakeDB([ALERT_SEARCH], PRICES)
-    tg = wire(alert_loop, db, [make_item("a1", "RTX 3070 Gigabyte OC", 180.0)])
+    tg = wire(alert_loop, db, [make_item("a1", "RTX 3070 Gigabyte OC", 220.0)])
 
     stats = alert_loop.run_once()
 
     assert stats["alerts_sent"] == 1
     assert tg.sent[0][0] == "a1" and tg.sent[0][1] == "new"
-    assert db.recorded == [("a1", 180.0, "new")]
+    assert db.recorded == [("a1", 220.0, "new")]
 
 
 def test_dry_run_never_writes_to_the_dedup_table(wire, monkeypatch):
@@ -303,7 +304,7 @@ def test_dry_run_never_writes_to_the_dedup_table(wire, monkeypatch):
     """
     monkeypatch.setattr(config, "DRY_RUN", True)
     db = FakeDB([ALERT_SEARCH], PRICES)
-    tg = wire(alert_loop, db, [make_item("a11", "RTX 3070 Gigabyte OC", 180.0)])
+    tg = wire(alert_loop, db, [make_item("a11", "RTX 3070 Gigabyte OC", 220.0)])
 
     stats = alert_loop.run_once()
 
@@ -331,13 +332,13 @@ def test_reserved_listing_is_never_alerted_but_is_still_observed(wire):
 
 def test_same_listing_same_price_is_not_resent(wire):
     db = FakeDB([ALERT_SEARCH], PRICES, alerted={"a4": [180.0]})
-    wire(alert_loop, db, [make_item("a4", "RTX 3070 Gigabyte", 180.0)])
+    wire(alert_loop, db, [make_item("a4", "RTX 3070 Gigabyte", 220.0)])
     assert alert_loop.run_once()["alerts_sent"] == 0
 
 
 def test_price_drop_resends(wire):
-    db = FakeDB([ALERT_SEARCH], PRICES, alerted={"a5": [190.0]})
-    tg = wire(alert_loop, db, [make_item("a5", "RTX 3070 Gigabyte", 160.0)])
+    db = FakeDB([ALERT_SEARCH], PRICES, alerted={"a5": [240.0]})
+    tg = wire(alert_loop, db, [make_item("a5", "RTX 3070 Gigabyte", 200.0)])
 
     assert alert_loop.run_once()["alerts_sent"] == 1
     assert tg.sent[0][1] == "price_drop"
@@ -345,7 +346,7 @@ def test_price_drop_resends(wire):
 
 def test_price_increase_does_not_resend(wire):
     db = FakeDB([ALERT_SEARCH], PRICES, alerted={"a6": [160.0]})
-    wire(alert_loop, db, [make_item("a6", "RTX 3070 Gigabyte", 190.0)])
+    wire(alert_loop, db, [make_item("a6", "RTX 3070 Gigabyte", 220.0)])
     assert alert_loop.run_once()["alerts_sent"] == 0
 
 
@@ -360,7 +361,7 @@ def test_junk_is_filtered_and_logged(wire):
 
 def test_laptop_with_a_matching_gpu_never_alerts(wire):
     db = FakeDB([ALERT_SEARCH], PRICES)
-    wire(alert_loop, db, [make_item("a8", "Lenovo Legion 5 RTX 3070", 190.0)])
+    wire(alert_loop, db, [make_item("a8", "Lenovo Legion 5 RTX 3070", 220.0)])
 
     assert alert_loop.run_once()["alerts_sent"] == 0
     assert db.junk[0]["category"] == "LAPTOP"
@@ -369,7 +370,7 @@ def test_laptop_with_a_matching_gpu_never_alerts(wire):
 def test_irrelevant_result_under_the_cap_is_dropped(wire):
     """Wallapop's loose matching returns CPUs for a GPU search."""
     db = FakeDB([ALERT_SEARCH], PRICES)
-    wire(alert_loop, db, [make_item("a9", "AMD Ryzen 7 7800X3D precintado", 190.0)])
+    wire(alert_loop, db, [make_item("a9", "RTX 4060 Gigabyte OC", 220.0)])
 
     assert alert_loop.run_once()["alerts_sent"] == 0
     assert db.junk == []  # not junk, just not what we searched for
@@ -390,17 +391,17 @@ def test_card_qualifies_via_offer_even_when_asking_is_above_the_ceiling(wire):
 
 
 def test_expensive_card_never_alerts_however_good_the_margin(wire):
-    """A price cap on the asking price outranks the margin verdict. A 4090 at
-    1100 with a 1050 ceiling clears the offer gate comfortably and still must
-    not fire — capital at risk on one purchase is a separate question from
-    whether the trade is good, which is what MAX_CAPITAL_PRICE answers now that
-    a priced listing is no longer held to the 350 EUR bootstrap ceiling."""
-    search = dict(ALERT_SEARCH, label="RTX 4090", keywords="rtx 4090",
-                  model_key="rtx_4090", max_price=None)
-    prices = {"rtx_4090": {"ref_price": 1200.0, "buy_ceiling": 1050.0,
-                           "buy_ceiling_in_person": 1150.0, "n_comps": 9, "is_seed": False}}
+    """A price cap on the asking price outranks the margin verdict. A 5080 at
+    690 with a 780 ceiling clears the offer gate comfortably and still must not
+    fire — capital at risk on one purchase is a separate question from whether
+    the trade is good, which is what MAX_CAPITAL_PRICE answers now that a priced
+    listing is no longer held to the bootstrap ceiling."""
+    search = dict(ALERT_SEARCH, label="RTX 5080", keywords="rtx 5080",
+                  model_key="rtx_5080", max_price=None)
+    prices = {"rtx_5080": {"ref_price": 900.0, "buy_ceiling": 780.0,
+                           "buy_ceiling_in_person": 830.0, "n_comps": 9, "is_seed": False}}
     db = FakeDB([search], prices)
-    tg = wire(alert_loop, db, [make_item("a11", "RTX 4090 Gigabyte", 1100.0)])
+    tg = wire(alert_loop, db, [make_item("a11", "RTX 5080 Asus", 690.0)])
 
     stats = alert_loop.run_once()
     assert stats["alerts_sent"] == 0
@@ -417,10 +418,10 @@ def test_underpriced_high_end_card_still_gets_through_the_cap(wire):
     prices = {"rtx_4080": {"ref_price": 620.0, "buy_ceiling": 525.0,
                            "buy_ceiling_in_person": 570.0, "n_comps": 9, "is_seed": False}}
     db = FakeDB([search], prices)
-    tg = wire(alert_loop, db, [make_item("a12", "RTX 4080 Gigabyte", 300.0)])
+    tg = wire(alert_loop, db, [make_item("a12", "RTX 4080 Gigabyte", 420.0)])
 
     assert alert_loop.run_once()["alerts_sent"] == 1
-    assert tg.sent[0][2] == 300.0
+    assert tg.sent[0][2] == 420.0
 
 
 def test_priced_listing_above_the_bootstrap_cap_is_still_evaluated(wire):
@@ -465,14 +466,15 @@ def test_capital_cap_still_binds_on_a_priced_listing(wire):
 def test_listing_with_no_reference_price_keeps_the_low_bootstrap_cap(wire):
     """The bootstrap path is the one MAX_ALERT_PRICE still governs, and it must
     not inherit the generous capital cap. With no learned price there is nothing
-    but a keyword match behind the alert, so the search's own 500 EUR bootstrap
-    cap is not sufficient protection — 400 EUR of capital on an unpriced guess
-    is exactly what the flat ceiling exists to refuse.
+    but a keyword match behind the alert, so the search's own 600 EUR bootstrap
+    cap is not sufficient protection — 500 EUR of capital on an unpriced guess
+    is exactly what the flat ceiling exists to refuse. MAX_ALERT_PRICE is 450
+    since 2026-08-26.
     """
     search = dict(ALERT_SEARCH, label="RTX 3070", keywords="rtx 3070",
-                  model_key="rtx_3070", max_price=500)
+                  model_key="rtx_3070", max_price=600)
     db = FakeDB([search], {})  # nothing learned, nothing seeded
-    tg = wire(alert_loop, db, [make_item("cap3", "RTX 3070 Asus Dual", 400.0)])
+    tg = wire(alert_loop, db, [make_item("cap3", "RTX 3070 Asus Dual", 500.0)])
 
     stats = alert_loop.run_once()
     assert stats["alerts_sent"] == 0
@@ -542,8 +544,8 @@ def test_blocked_seller_never_alerts(wire, monkeypatch):
         alert_loop,
         db,
         [
-            make_item("bs1", "RTX 3070 Gigabyte", 180.0, seller_id="u666"),
-            make_item("bs2", "RTX 3070 Asus", 180.0, seller_id="u1"),
+            make_item("bs1", "RTX 3070 Gigabyte", 220.0, seller_id="u666"),
+            make_item("bs2", "RTX 3070 Asus", 220.0, seller_id="u1"),
         ],
     )
 
@@ -557,7 +559,7 @@ def test_blocked_seller_listing_is_still_recorded(wire, monkeypatch):
     prices the market and still has to be visible for tuning the block list."""
     monkeypatch.setattr(config, "BLOCKED_SELLERS", frozenset({"u666"}))
     db = FakeDB([ALERT_SEARCH], PRICES)
-    wire(alert_loop, db, [make_item("bs3", "RTX 3070 Gigabyte", 180.0, seller_id="u666")])
+    wire(alert_loop, db, [make_item("bs3", "RTX 3070 Gigabyte", 220.0, seller_id="u666")])
 
     alert_loop.run_once()
     assert db.listings[0]["seller_id"] == "u666"
@@ -568,33 +570,31 @@ def test_seller_id_is_persisted_by_both_loops(wire):
     """A block list can only be maintained from ids the database actually holds,
     so both loops have to write the column."""
     adb = FakeDB([ALERT_SEARCH], PRICES)
-    wire(alert_loop, adb, [make_item("sid1", "RTX 3070 Gigabyte", 180.0, seller_id="u42")])
+    wire(alert_loop, adb, [make_item("sid1", "RTX 3070 Gigabyte", 220.0, seller_id="u42")])
     alert_loop.run_once()
 
     cdb = FakeDB([dict(ALERT_SEARCH, role="comps", label="Comps RTX 3070")], PRICES)
-    wire(comps_loop, cdb, [make_item("sid1", "RTX 3070 Gigabyte", 180.0, seller_id="u42")])
+    wire(comps_loop, cdb, [make_item("sid1", "RTX 3070 Gigabyte", 220.0, seller_id="u42")])
     comps_loop.run_once()
 
     assert adb.listings[0]["seller_id"] == "u42"
     assert cdb.listings[0]["seller_id"] == "u42"
 
 
-def test_an_extremely_cheap_listing_is_sent_for_the_owner_to_judge(wire):
-    """The owner's explicit decision, reversing an earlier trade-off.
+def test_an_extremely_cheap_listing_is_now_rejected(wire):
+    """The owner's decision, reversed again on 2026-08-26.
 
-    The margin engine is structurally blind here — the more absurd a price, the
-    better the margin it computes — and MIN_PLAUSIBLE_RATIO used to reject
-    anything under 35% of the reference for exactly that reason. It was turned
-    off because it could not tell a replica from a drawer-clearing bargain, and
-    it dropped the single most profitable listing the bot could ever find in
-    order to also drop the fakes. Legitimacy is cheap for a person to judge from
-    photos, a seller profile and a description, and expensive for a filter.
+    MIN_PLAUSIBLE_RATIO was 0.35, then 0 (send everything that clears the margin
+    and let a person judge legitimacy from the photos), and is now 0.65 — the
+    strictest it has ever been. Live experience decided it: fakes reaching the
+    feed cost more than the missed steals did.
 
-    So a 4090 at 340 against a 1200 reference is now sent, and the caption
-    carries the reference price next to the asking price so the ratio this used
-    to enforce is visible by eye.
+    A 4090 at 340 against a 1200 reference is 28% of the reference. It clears
+    the margin gate by a mile and is refused anyway, without being evaluated —
+    which is precisely the trade being made here, and precisely where the
+    biggest genuine wins used to come from.
 
-    Set MIN_PLAUSIBLE_RATIO=0.35 to restore the old behaviour; this test then
+    Set MIN_PLAUSIBLE_RATIO=0 to restore the previous behaviour; this test then
     fails, which is the point — it pins a policy choice, not an accident.
     """
     search = dict(ALERT_SEARCH, label="RTX 4090", keywords="rtx 4090",
@@ -604,14 +604,56 @@ def test_an_extremely_cheap_listing_is_sent_for_the_owner_to_judge(wire):
     db = FakeDB([search], prices)
     tg = wire(alert_loop, db, [make_item("a13", "RTX 4090 Gigabyte", 340.0)])
 
+    assert alert_loop.run_once()["alerts_sent"] == 0
+    assert tg.sent == []
+
+
+def test_a_listing_just_above_the_plausibility_floor_is_sent(wire):
+    """The counterpart, so the test above cannot pass by the feed being broken.
+    On a 620 EUR reference the floor is 403 and the capital cap is 500, so 480
+    clears the floor, the cap and the buy ceiling."""
+    search = dict(ALERT_SEARCH, label="RTX 4080", keywords="rtx 4080",
+                  model_key="rtx_4080", max_price=None)
+    prices = {"rtx_4080": {"ref_price": 620.0, "buy_ceiling": 525.0,
+                           "buy_ceiling_in_person": 570.0, "n_comps": 9, "is_seed": False}}
+    db = FakeDB([search], prices)
+    tg = wire(alert_loop, db, [make_item("a15", "RTX 4080 Gigabyte", 480.0)])
+
     assert alert_loop.run_once()["alerts_sent"] == 1
     assert len(tg.sent) == 1
 
 
+def test_the_floor_and_the_capital_cap_leave_a_dead_zone_for_top_cards():
+    """Two settings that are each reasonable alone and interact badly.
+
+    MIN_PLAUSIBLE_RATIO refuses anything under 65% of the reference; the capital
+    cap refuses anything over MAX_CAPITAL_PRICE. Above a reference of
+    MAX_CAPITAL_PRICE / MIN_PLAUSIBLE_RATIO the floor rises *above* the cap and
+    the allowed window closes completely, so the model can never alert at any
+    price whatsoever.
+
+    At the 2026-08-26 settings (500 / 0.65) that breakeven is ~769 EUR. The RTX
+    4090 and 5090 were deleted from the registry rather than left in it dead,
+    but the RTX 5080 (seed 900) is still tracked and still inside the dead zone:
+    it can learn a price and will never alert on one. This is a consequence, not
+    a decision — the test exists so it stays visible and fails loudly if either
+    number moves.
+    """
+    breakeven = config.MAX_CAPITAL_PRICE / config.MIN_PLAUSIBLE_RATIO
+    for ref in (900.0,):  # rtx_5080 seed reference
+        assert ref > breakeven
+        floor = ref * config.MIN_PLAUSIBLE_RATIO
+        assert floor > config.MAX_CAPITAL_PRICE
+        row = {"ref_price": ref, "buy_ceiling": ref * 0.85,
+               "buy_ceiling_in_person": ref * 0.93, "n_comps": 9}
+        # Everything the cap allows is below the floor.
+        assert not pricing.evaluate(config.MAX_CAPITAL_PRICE, row, None).qualifies
+
+
 def test_nothing_under_the_sanity_floor_is_ever_sent(wire):
-    """The one lower bound the owner kept. MIN_PLAUSIBLE_RATIO is off, so this
-    is now the *only* thing standing between the feed and a 20 EUR "RTX 4090" —
-    which makes it load-bearing in a way it was not before.
+    """The absolute floor, below the plausibility ratio and independent of it.
+    A 49 EUR listing is refused on the sanity band alone, before any reference
+    price is consulted at all.
     """
     search = dict(ALERT_SEARCH, label="RTX 4090", keywords="rtx 4090",
                   model_key="rtx_4090", max_price=None)
@@ -632,8 +674,8 @@ def test_bottom_condition_tier_is_blocked_but_fair_is_not(wire):
         alert_loop,
         db,
         [
-            make_item("dead", "RTX 3070 Gigabyte", 180.0, condition="has_given_it_all"),
-            make_item("worn", "RTX 3070 Asus Dual", 180.0, condition="fair"),
+            make_item("dead", "RTX 3070 Gigabyte", 220.0, condition="has_given_it_all"),
+            make_item("worn", "RTX 3070 Asus Dual", 220.0, condition="fair"),
         ],
     )
 
@@ -691,11 +733,11 @@ def test_both_loops_write_the_same_listing_columns(wire):
     so a listing's column set depended on which loop happened to see it. They
     are one function now; this pins that they stay one."""
     adb = FakeDB([ALERT_SEARCH], PRICES)
-    wire(alert_loop, adb, [make_item("cols1", "RTX 3070 Gigabyte OC", 180.0)])
+    wire(alert_loop, adb, [make_item("cols1", "RTX 3070 Gigabyte OC", 220.0)])
     alert_loop.run_once()
 
     cdb = FakeDB([dict(ALERT_SEARCH, role="comps", label="Comps RTX 3070")], PRICES)
-    wire(comps_loop, cdb, [make_item("cols1", "RTX 3070 Gigabyte OC", 180.0)])
+    wire(comps_loop, cdb, [make_item("cols1", "RTX 3070 Gigabyte OC", 220.0)])
     comps_loop.run_once()
 
     assert set(adb.listings[0]) == set(cdb.listings[0])
@@ -712,7 +754,7 @@ def test_modified_at_is_persisted(wire):
     wire(
         alert_loop,
         db,
-        [make_item("m1", "RTX 3070 Gigabyte OC", 180.0, modified_at=edited)],
+        [make_item("m1", "RTX 3070 Gigabyte OC", 220.0, modified_at=edited)],
     )
 
     alert_loop.run_once()
@@ -733,7 +775,7 @@ def test_enriched_detail_fields_are_written_back(wire):
     wire(
         alert_loop,
         db,
-        [make_item("en1", "RTX 3070 Gigabyte OC", 180.0)],
+        [make_item("en1", "RTX 3070 Gigabyte OC", 220.0)],
         details={
             "en1": make_item(
                 "en1", "RTX 3070 Gigabyte OC", 180.0, condition="good", brand="Gigabyte"
@@ -759,7 +801,7 @@ def test_enriched_write_back_is_one_batch(wire):
         alert_loop,
         db,
         [
-            make_item("eb1", "RTX 3070 Gigabyte OC", 180.0),
+            make_item("eb1", "RTX 3070 Gigabyte OC", 220.0),
             make_item("eb2", "RTX 3070 Asus Dual", 175.0),
             make_item("eb3", "RTX 3070 MSI Ventus", 170.0),
         ],
@@ -1009,7 +1051,7 @@ def test_unchanged_listing_writes_no_second_observation(wire):
     untouched for weeks produced thousands of identical rows that the comps
     pool then deduped straight back down to one price per item."""
     db = FakeDB([ALERT_SEARCH], PRICES)
-    item = make_item("s1", "RTX 3070 Gigabyte OC", 180.0)
+    item = make_item("s1", "RTX 3070 Gigabyte OC", 220.0)
     wire(alert_loop, db, [item])
 
     alert_loop.run_once()
@@ -1022,7 +1064,7 @@ def test_unchanged_listing_writes_no_second_observation(wire):
 
 def test_a_price_change_still_records_an_observation(wire):
     db = FakeDB([ALERT_SEARCH], PRICES)
-    wire(alert_loop, db, [make_item("s2", "RTX 3070 Gigabyte OC", 180.0)])
+    wire(alert_loop, db, [make_item("s2", "RTX 3070 Gigabyte OC", 220.0)])
     alert_loop.run_once()
     assert len(db.observations) == 1
 
@@ -1034,10 +1076,10 @@ def test_a_price_change_still_records_an_observation(wire):
 
 def test_a_status_change_still_records_an_observation(wire):
     db = FakeDB([ALERT_SEARCH], PRICES)
-    wire(alert_loop, db, [make_item("s3", "RTX 3070 Gigabyte OC", 180.0)])
+    wire(alert_loop, db, [make_item("s3", "RTX 3070 Gigabyte OC", 220.0)])
     alert_loop.run_once()
 
-    wire(alert_loop, db, [make_item("s3", "RTX 3070 Gigabyte OC", 180.0, reserved=True)])
+    wire(alert_loop, db, [make_item("s3", "RTX 3070 Gigabyte OC", 220.0, reserved=True)])
     alert_loop.run_once()
     assert db.observations[-1]["status"] == "reserved"
 
@@ -1047,7 +1089,7 @@ def test_comps_loop_sweeps_both_retention_tables(wire):
     in 16 days — so its sweep has to run, not just the observations one."""
     search = dict(ALERT_SEARCH, role="comps", label="Comps RTX 3070")
     db = FakeDB([search], PRICES)
-    wire(comps_loop, db, [make_item("c1", "RTX 3070 Gigabyte OC", 180.0)])
+    wire(comps_loop, db, [make_item("c1", "RTX 3070 Gigabyte OC", 220.0)])
 
     comps_loop.run_once()
     assert db.purged, "observations retention did not run"
@@ -1060,7 +1102,7 @@ def test_listings_are_written_before_their_observations(wire):
     observation. The change comparison needs the *old* state though, so the
     order has to be: snapshot states, upsert listings, then observe."""
     db = FakeDB([ALERT_SEARCH], PRICES)
-    wire(alert_loop, db, [make_item("fk1", "RTX 3070 Gigabyte OC", 180.0)])
+    wire(alert_loop, db, [make_item("fk1", "RTX 3070 Gigabyte OC", 220.0)])
 
     alert_loop.run_once()
 
@@ -1090,7 +1132,7 @@ def test_dead_man_fires_after_consecutive_empty_runs(wire):
 def test_dead_man_stays_quiet_while_items_are_flowing(wire):
     healthy = dict(_empty_run(), items_seen=120)
     db = FakeDB([ALERT_SEARCH], PRICES, runs=[healthy] * config.DEAD_MAN_RUNS)
-    tg = wire(alert_loop, db, [make_item("d1", "RTX 3070 Gigabyte OC", 180.0)])
+    tg = wire(alert_loop, db, [make_item("d1", "RTX 3070 Gigabyte OC", 220.0)])
 
     alert_loop.run_once()
     assert tg.errors == []
@@ -1162,7 +1204,7 @@ def test_dead_man_cooldown_does_not_mask_a_healthy_loop(wire):
     the streak check still gates everything."""
     healthy = dict(_empty_run(), items_seen=120)
     db = FakeDB([ALERT_SEARCH], PRICES, runs=[healthy, _marked_run(1), healthy])
-    tg = wire(alert_loop, db, [make_item("dm1", "RTX 3070 Gigabyte OC", 180.0)])
+    tg = wire(alert_loop, db, [make_item("dm1", "RTX 3070 Gigabyte OC", 220.0)])
 
     alert_loop.run_once()
     assert tg.errors == []

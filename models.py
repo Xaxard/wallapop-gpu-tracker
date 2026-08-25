@@ -119,7 +119,6 @@ def _iph(n: str, *suffix: str) -> str:
 # Ordered most-specific first. First match wins.
 REGISTRY: tuple[ModelDef, ...] = (
     # ---------------------------------------------------------- RTX 50 series
-    ModelDef("rtx_5090", "RTX 5090", _num("5090")),
     ModelDef("rtx_5080", "RTX 5080", _num("5080")),
     ModelDef("rtx_5070_ti", "RTX 5070 Ti", _num("5070", "ti")),
     ModelDef("rtx_5070", "RTX 5070", _num("5070")),
@@ -128,7 +127,6 @@ REGISTRY: tuple[ModelDef, ...] = (
     ModelDef("rtx_5060_ti", "RTX 5060 Ti", _num("5060", "ti")),
     ModelDef("rtx_5060", "RTX 5060", _num("5060")),
     # ---------------------------------------------------------- RTX 40 series
-    ModelDef("rtx_4090", "RTX 4090", _num("4090")),
     ModelDef("rtx_4080_super", "RTX 4080 Super", _num("4080", "super")),
     ModelDef("rtx_4080", "RTX 4080", _num("4080")),
     ModelDef("rtx_4070_ti_super", "RTX 4070 Ti Super", _num("4070", "ti", "super")),
