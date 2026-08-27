@@ -12,6 +12,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import junk  # noqa: E402
+import models  # noqa: E402
 
 
 # ----------------------------------------------------------------- no da video
@@ -140,3 +141,172 @@ def test_gpu_rules_still_fire_after_the_phone_branch():
     laptop rules must still be reachable for everything else."""
     assert junk.check("PC gaming con RTX 4070").category == "BUNDLE"
     assert junk.check("Portatil MSI RTX 4060").category == "LAPTOP"
+
+
+# --------------------------------------------------------------------- consoles
+# Every title below is real, sampled from Wallapop on 2026-08-26 by searching
+# the same keywords the comps searches use. The split between the two lists is
+# the whole reason the console rules exist: roughly four in five results
+# carrying a console's name are a game or an accessory, and a game is a real
+# listing at a real price that really sells — so nothing downstream would ever
+# notice it dragging a console's reference toward 70 EUR.
+
+REAL_CONSOLES = [
+    "Ps5 pro 2tb blanca sin caja",
+    "PS5 Pro 2TB",
+    "Play 5 edicion digital + mando dualsense",
+    "Consola PS5 con mando y cables",
+    "Consola PlayStation 5 Blanca",
+    "Playstation 5",
+    "PS5 Sony como nueva",
+    "PS5 Slim 1TB de disco",
+    "PS5+dos controladores+juego+auriculares",
+    "Consola PS5 Lector de Disco +Rdr2",
+    "Xbox series x",
+    "Xbox Series X + 2 mandos nuevos",
+    "Consola Xbox Series X + 2 Mandos y Juegos",
+    "Xbox Series X con caja",
+    "Xbox Series X 1TB SSD con 2 mandos",
+    "Xbox Series X 1TB + Mando Elite series 2",
+    "Xbox Series X + Forza Horizon 5 Pack",
+]
+
+NOT_CONSOLES = [
+    "Elden Ring PS5",
+    "Ghost of Yotei PS5 Juego",
+    "EA Sports FC 26 PS5",
+    "Call of Duty Modern Warfare II para PS5",
+    "Skylanders Trap Team PlayStation 4 PS4/PS5",
+    "Hogwarts Legacy Xbox Series X",
+    "FIFA 23 para Xbox Series X",
+    "Resident Evil 4 Xbox Series X",
+    "Avatar Frontiers of Pandora Xbox Series X",
+    "the crew motorfest edition limited ps5",
+    "Mando Xbox Series X",
+    "Mando DualSense PS5",
+    "Mando PS5 - Reparación de DRIFT",
+    "Base de carga para Mandos PS5 Gaming",
+    "Auriculares Sony Pulse 3D (PS5)",
+    "Soporte Mando PS5 Batman Cable Guy",
+    "Logo PS5",
+    "Nevera Consola XBOX Series X 10L",
+    "Dying Light 2 Stay Human Xbox Series X/S",
+    "Crash Bandicoot 4 Xbox One/Series X",
+    "Watch Dogs Legion Xbox One / Series X",
+    "Pack 3 juegos xbox serie X.",
+    "Auricular Ps4 compatible ps5, xbox series x/s, xbox one",
+    "Mando Xbox Anti Drift Series X Original",
+    "Sony A80J OLED 55 4K 120Hz HDMI 2.1 PS5",
+]
+
+
+def _priced_as_console(title):
+    """What the pipeline actually does: junk first, then classify."""
+    if junk.check(title).excluded:
+        return None
+    match = models.classify(title)
+    if match.priceable and match.family == "console":
+        return match.model_key
+    return None
+
+
+@pytest.mark.parametrize("title", REAL_CONSOLES)
+def test_a_real_console_reaches_the_comps_pool(title):
+    assert _priced_as_console(title) is not None, title
+
+
+@pytest.mark.parametrize("title", NOT_CONSOLES)
+def test_a_game_or_accessory_never_reaches_the_comps_pool(title):
+    """The expensive failure. A 70 EUR game admitted to the PS5 pool looks
+    entirely normal to every downstream check — it is a real price someone
+    really paid — and there is no way to notice it afterwards."""
+    assert _priced_as_console(title) is None, title
+
+
+@pytest.mark.parametrize("title,expected", [
+    ("Ps5 pro 2tb blanca sin caja", "ps5_pro"),
+    ("PS5 Pro 2TB", "ps5_pro"),
+    ("Play 5 edicion digital + mando dualsense", "ps5_digital"),
+    ("PS5 Slim Edicion Digital 1TB", "ps5_digital"),
+    ("Consola PS5 con mando y cables", "ps5"),
+    ("PS5 Slim 1TB de disco", "ps5"),
+    ("PS 5 con dos mandos", "ps5"),
+    ("Play 5 con caja", "ps5"),
+    ("Xbox series x", "xbox_series_x"),
+    ("Consola Xbox Serie X", "xbox_series_x"),
+])
+def test_console_skus_are_told_apart(title, expected):
+    """A Pro and a Digital are a couple of hundred euros apart; a median over
+    both describes neither."""
+    assert _priced_as_console(title) == expected
+
+
+@pytest.mark.parametrize("title", [
+    "Xbox Series S 512GB",          # the S is not the X
+    "Consola Xbox Series S",
+    "Xbox One X 1TB",               # One X is not Series X
+    "Consola Xbox One X",
+    "PS4 Pro 1TB",                  # PS4 Pro is not PS5 Pro
+    "Consola PS4 Slim",
+    "Consola PlayStation 4",
+    "Consola PS3 Super Slim",
+    "PSP Street",
+    "Nintendo Switch OLED",
+])
+def test_a_neighbouring_console_never_maps_to_a_tracked_one(title):
+    """The model numbers here collide by design — Sony and Microsoft both count
+    upward and both sell a 'Pro' and an 'X'."""
+    assert _priced_as_console(title) is None, title
+
+
+def test_consoles_can_never_alert():
+    """Three independent mechanisms, and this pins the one in the classifier:
+    a console match carries family 'console', which is not in
+    alert_loop.ALERTING_FAMILIES."""
+    import alert_loop
+    for title in REAL_CONSOLES:
+        match = models.classify(title)
+        assert match.family == "console"
+        assert match.family not in alert_loop.ALERTING_FAMILIES
+
+
+# A handful of games lead with the platform exactly the way a console listing
+# does. No wording rule separates "PS5 Spiderman 2" from "PS5 Sony como nueva",
+# so the pool floor is what has to catch them — all four titles below are real,
+# sampled live on 2026-08-26 at the prices given.
+GAMES_THAT_LOOK_LIKE_CONSOLES = [
+    ("PS5 Necrophosis Full Consciousness", 25.0),
+    ("PS5 Assassin's Creed Valhalla", 15.0),
+    ("PS5 Spiderman 2", 38.0),
+    ("PS5 One Piece Odyssey", 12.0),
+    ("PS5 Elden Ring Nightreign edicion nueva", 69.99),  # a sealed new release
+]
+
+
+@pytest.mark.parametrize("title,price", GAMES_THAT_LOOK_LIKE_CONSOLES)
+def test_a_game_titled_like_a_console_is_kept_out_by_the_pool_floor(title, price):
+    """These do classify as consoles, deliberately — the classifier has no
+    price and there is no wording that separates them. config's per-family
+    floor is the gate, and this pins the two working together."""
+    import config
+    import pricing
+
+    floor = config.MIN_COMP_PRICE_BY_FAMILY["console"]
+    assert not pricing.comp_sane(price, floor), f"{title} at {price} must not enter the pool"
+
+
+@pytest.mark.parametrize("price", [300.0, 360.0, 450.0, 780.0])
+def test_a_real_console_price_still_enters_the_pool(price):
+    """The counterpart, so the floor cannot pass by excluding everything."""
+    import config
+    import pricing
+
+    floor = config.MIN_COMP_PRICE_BY_FAMILY["console"]
+    assert pricing.comp_sane(price, floor)
+
+
+def test_the_console_floor_sits_between_a_new_game_and_a_beaten_console():
+    import config
+
+    floor = config.MIN_COMP_PRICE_BY_FAMILY["console"]
+    assert 80 < floor < 250, "floor must clear a sealed game and stay under any real console"

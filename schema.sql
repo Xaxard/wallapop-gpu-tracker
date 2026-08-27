@@ -69,7 +69,10 @@ alter table listings add column if not exists user_allows_shipping boolean;
 -- without this column the only way to tell a card row from a handset row is to
 -- pattern-match the model_key.
 alter table listings add column if not exists family text;
-  -- 'gpu' | 'phone'
+  -- 'gpu' | 'phone' | 'console'
+  -- Only 'gpu' may ever produce an alert (alert_loop.ALERTING_FAMILIES).
+  -- Phones (iPhone 15-17) and consoles (PS5, Xbox Series X) are tracked so the
+  -- bot learns what they resell for, and nothing more.
 alter table listings add column if not exists storage text;
   -- phones: '128gb' | '256gb' | '512gb' | '1tb' — the biggest price driver
   -- within one model, recorded now so the pools can be split by capacity later

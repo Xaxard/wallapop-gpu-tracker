@@ -136,7 +136,7 @@ def sane(price: float | None) -> bool:
     return price is not None and config.MIN_SANE_PRICE <= price <= config.MAX_SANE_PRICE
 
 
-def comp_sane(price: float | None) -> bool:
+def comp_sane(price: float | None, floor: float | None = None) -> bool:
     """May this price be admitted to the reference-price pool?
 
     Separate from sane() on purpose, even though the two floors happen to be
@@ -148,12 +148,18 @@ def comp_sane(price: float | None) -> bool:
     alert path keeps MIN_SANE_PRICE. See config.MIN_COMP_PRICE for why the
     owner's literal "exclude anything under 5 EUR" is implemented as 50.
 
+    `floor` overrides MIN_COMP_PRICE for families where it means something
+    different — see config.MIN_COMP_PRICE_BY_FAMILY, and collect_comps, which is
+    the only caller that sets it.
+
     The upper bound is MAX_COMP_PRICE, and it is separate for the same reason
     the floor is. A 1400 EUR sale is not a trade this bot would ever make, but
     it is still evidence of what the card is worth — and refusing to learn from
     it does not make the bot safer, it just leaves the model on its seed guess.
     """
-    return price is not None and config.MIN_COMP_PRICE <= price <= config.MAX_COMP_PRICE
+    if floor is None:
+        floor = config.MIN_COMP_PRICE
+    return price is not None and floor <= price <= config.MAX_COMP_PRICE
 
 
 def ref_sane(price: float | None) -> bool:
@@ -230,13 +236,21 @@ def collect_comps(db: Database, model_key: str) -> list[Comp]:
     since = now() - timedelta(days=config.COMPS_WINDOW_DAYS)
     per_item: dict[str, Comp] = {}
 
+    # The pool floor is family-dependent. A console search returns the console's
+    # games in bulk and some of them are titled exactly like a console, so the
+    # floor is what keeps a 38 EUR disc out of a pool whose median is meant to
+    # describe a 400 EUR machine. See config.MIN_COMP_PRICE_BY_FAMILY.
+    floor = config.MIN_COMP_PRICE_BY_FAMILY.get(
+        models.family_of(model_key) or "", config.MIN_COMP_PRICE
+    )
+
     # Reserved observations, newest first, so the first hit per item wins. The
     # status == 'reserved' filter lives in db.reserved_comps, which is what keeps
     # active asking prices out — an 'active' row is never returned here.
     for row in db.reserved_comps(model_key, since):
         item_id = row["item_id"]
         price = row.get("price")
-        if item_id in per_item or not comp_sane(price):
+        if item_id in per_item or not comp_sane(price, floor):
             continue
         age = _age_days(_parse_dt(row.get("seen_at")))
         per_item[item_id] = Comp(float(price), config.RESERVED_WEIGHT * _time_decay(age), "reserved")
@@ -246,7 +260,7 @@ def collect_comps(db: Database, model_key: str) -> list[Comp]:
     for row in db.sold_comps(model_key, since):
         item_id = row["item_id"]
         price = row.get("sold_price")
-        if not comp_sane(price):
+        if not comp_sane(price, floor):
             continue
         age = _age_days(_parse_dt(row.get("closed_at")))
         per_item[item_id] = Comp(float(price), config.SOLD_WEIGHT * _time_decay(age), "sold")

@@ -313,6 +313,22 @@ MAX_SANE_PRICE = _f("MAX_SANE_PRICE", 1000.0)
 # set MIN_COMP_PRICE=5 to get the literal behaviour.
 MIN_COMP_PRICE = _f("MIN_COMP_PRICE", 50.0)
 
+# Per-family override of the pool floor, for families where the generic 50 EUR
+# means something quite different.
+#
+# A console search returns the console's *games* in bulk, and a handful of them
+# lead with the platform exactly the way a console listing does — "PS5 Spiderman
+# 2", "PS5 One Piece Odyssey" are both real, both sampled live on 2026-08-26.
+# No wording rule separates those from "PS5 Sony como nueva"; the thing that
+# actually separates them is that nobody sells a PlayStation 5 for 38 EUR.
+#
+# So the floor does the work the words cannot, which is the same argument
+# MIN_COMP_PRICE itself rests on. 150 sits far below any real console (a beaten
+# Series X is ~300) and far above any game, including a sealed new release.
+MIN_COMP_PRICE_BY_FAMILY = {
+    "console": _f("MIN_COMP_PRICE_CONSOLE", 150.0),
+}
+
 # Ceiling on a price allowed into the reference-price pool, and on a learned
 # reference itself. Deliberately NOT MAX_SANE_PRICE.
 #

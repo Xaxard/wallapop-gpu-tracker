@@ -32,7 +32,7 @@ from __future__ import annotations
 
 import re
 import unicodedata
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 
 # --------------------------------------------------------------- normalising
@@ -116,6 +116,35 @@ def _iph(n: str, *suffix: str) -> str:
     return "".join(parts) + r"\b"
 
 
+# Console name as normalise() leaves it: "PS5" arrives as "ps 5", "PlayStation
+# 5" unchanged, "Xbox Series X" unchanged. Sellers write all of these, plus
+# "Play 5" and the singular "serie x".
+_PS5 = r"(?:\bps\s*5\b|\bplay\s*(?:station\s*)?5\b)"
+_XSX = r"\bxbox\s+seri[ea]s?\s+x\b"
+
+# Nouns that open a genuine console listing, shared with junk.py (which imports
+# them from here — the dependency runs junk -> models, never the other way).
+#
+# This is the whole basis of console classification, and it is an observation
+# about how the two kinds of listing are written rather than a heuristic: a
+# console leads with what it is ("Consola PS5 con mando", "Xbox Series X 1TB
+# SSD con 2 mandos"), while a game leads with the game and names the platform
+# afterwards, because the platform is what buyers search for ("Elden Ring PS5",
+# "Hogwarts Legacy Xbox Series X"). Sampled live on 2026-08-26, this separated
+# 17 consoles from 25 games and accessories with no errors either way.
+CONSOLE_LEAD_NOUNS = (
+    "consola", "consolas",
+    "ps 5", "playstation 5", "play station 5", "play 5",
+    "xbox series x", "xbox serie x", "xbox series s", "xbox serie s", "xbox",
+)
+
+
+def _console_titled(norm_title: str) -> bool:
+    """True when the title opens by naming the console itself."""
+    head = " ".join(norm_title.split()[:3])
+    return any(head.startswith(noun) for noun in CONSOLE_LEAD_NOUNS)
+
+
 # Ordered most-specific first. First match wins.
 REGISTRY: tuple[ModelDef, ...] = (
     # ---------------------------------------------------------- RTX 50 series
@@ -182,6 +211,23 @@ REGISTRY: tuple[ModelDef, ...] = (
     #
     # `\s+` between tokens rather than optional separators because normalise()
     # collapses everything to single spaces.
+    # ------------------------------------------------------------- consoles
+    # Comps only, like the phones: tracked so the bot learns what they resell
+    # for, never alerted on (alert_loop.ALERTING_FAMILIES).
+    #
+    # Split by SKU because the price spread within "a PS5" is far too wide to
+    # pool — a Pro and a Digital are a couple of hundred euros apart, and a
+    # median over both describes neither. Ordered most-specific first, so a
+    # "PS5 Pro" never falls through to the base model.
+    ModelDef("ps5_pro", "PS5 Pro", _PS5 + r"\s+pro\b", family="console"),
+    # Up to two words may sit between the name and "digital", because sellers
+    # write "PS5 Slim Edicion Digital" as often as "PS5 Digital".
+    ModelDef("ps5_digital", "PS5 Digital",
+             _PS5 + r"\s+(?:\w+\s+){0,2}?(?:edicion\s+)?digital\b", family="console"),
+    ModelDef("ps5", "PS5", _PS5, family="console"),
+    # Requires "series"/"serie" so "Xbox One X" can never match, and ends on a
+    # word boundary so "Xbox Series S" cannot either.
+    ModelDef("xbox_series_x", "Xbox Series X", _XSX, family="console"),
     ModelDef("iphone_15_pro_max", "iPhone 15 Pro Max", _iph("15", "pro", "max"), family="phone"),
     ModelDef("iphone_15_pro", "iPhone 15 Pro", _iph("15", "pro"), family="phone"),
     ModelDef("iphone_15_plus", "iPhone 15 Plus", _iph("15", "plus"), family="phone"),
@@ -331,6 +377,17 @@ def _confidence(norm_text: str, has_vram_proof: bool, key: str) -> str:
         # match. There is no equivalent of a bare "4070" here.
         return "high" if _has_token(norm_text, APPLE_TOKENS) else "medium"
 
+    if key in _CONSOLE_KEYS:
+        # Same reasoning as phones, and stronger: the console patterns require
+        # "ps5" / "xbox series x" outright, so there is no bare number to
+        # mistake and no rival vendor whose branding could collide — Sony and
+        # Microsoft do not make each other's consoles.
+        #
+        # Note this is not the whole test. classify() still refuses to price a
+        # console whose title merely *mentions* it, which is what actually
+        # separates a console from the game named after it.
+        return "high"
+
     own, rival = (
         (AMD_TOKENS, NVIDIA_TOKENS) if key.startswith("rx_") else (NVIDIA_TOKENS, AMD_TOKENS)
     )
@@ -443,6 +500,18 @@ def classify(title: str | None, description: str | None = None) -> Match:
     # it's far noisier (system RAM, other parts in a bundle, ...).
     match = _scan(norm_title, vram_fallback=norm_desc)
     if match is not None:
+        # A console name in a title is not evidence the listing *is* a console.
+        # It is overwhelmingly a game or an accessory naming its platform, and
+        # junk.py catches only the ones that say so outright — "Mando PS5",
+        # "FIFA 23 para Xbox Series X", anything naming two platforms. What is
+        # left is the bare game title, "Elden Ring PS5", which carries no junk
+        # signal at all and would otherwise price a 70 EUR disc as a console.
+        #
+        # So the same remedy the description-only branch below uses: keep the
+        # match for observability, withhold priceability. Nothing unpriceable
+        # can reach a comps pool, which is the only thing consoles are for.
+        if match.family == "console" and not _console_titled(norm_title):
+            return replace(match, confidence="low")
         return match
 
     if norm_desc:
@@ -485,6 +554,8 @@ def classify(title: str | None, description: str | None = None) -> Match:
 
     return NO_MATCH
 
+
+_CONSOLE_KEYS = frozenset(m.key for m in REGISTRY if m.family == "console")
 
 FAMILY_BY_KEY = {m.key: m.family for m in REGISTRY}
 

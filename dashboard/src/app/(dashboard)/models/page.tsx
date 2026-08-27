@@ -12,8 +12,8 @@ export default async function ModelsPage() {
         <h1 className="text-lg font-semibold tracking-tight">Models</h1>
         <p className="text-sm text-muted-foreground">
           Pricing engine health — one row per model the tracker prices. Not all of
-          them are tradeable: the iPhone rows are tracked for their comps only and
-          can never produce an alert (alert_loop.ALERTING_FAMILIES).
+          them are tradeable: the iPhone and console rows are tracked for their
+          comps only and can never produce an alert (alert_loop.ALERTING_FAMILIES).
         </p>
       </div>
       {models.length === 0 ? (

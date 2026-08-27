@@ -12,7 +12,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
-from models import normalise
+from models import CONSOLE_LEAD_NOUNS, normalise
 
 # Phrases are matched against the accent-stripped, punctuation-collapsed text,
 # so they're written here in the same normalised form (no accents).
@@ -200,6 +200,75 @@ PHONE_ACCESSORY_PREFIXES = frozenset({
     "maqueta", "imitacion", "repuesto", "repuestos",
 })
 
+# ---------------------------------------------------------------- consoles
+# PS5 and Xbox Series X are tracked for comps only (family 'console',
+# alert_loop.ALERTING_FAMILIES), and the noise on a console search is unlike
+# anything else this bot searches. Sampling `ps5` and `xbox series x` live on
+# 2026-08-26, roughly four listings in five carrying the console's name were a
+# *game* or an accessory: "Elden Ring PS5", "Mando DualSense PS5", "FIFA 23
+# para Xbox Series X", and — genuinely — "Nevera Consola XBOX Series X 10L", a
+# novelty fridge.
+#
+# That matters more here than a bad GPU alert would. A game is a real listing
+# at a real price that really sells, so it does not look wrong to any of the
+# sale-inference machinery; it just quietly drags a console's reference price
+# toward 70 EUR. The pool has no way to notice.
+#
+# Note normalise() has already destroyed the slash that makes cross-platform
+# listings obvious to a human: "PS4/PS5" arrives as "ps 4 ps 5" and "Series
+# X/S" as "series x s". The rules below work on that shape, not on the
+# punctuation.
+
+# Nouns that open an accessory listing. Prefix-only, following the same
+# founding rule as PHONE_ACCESSORY_PREFIXES: "Xbox Series X 1TB SSD con 2
+# mandos" is a console sold with controllers and must survive, while "Mando
+# Xbox Series X" must not.
+CONSOLE_ACCESSORY_PREFIXES = frozenset({
+    "mando", "mandos", "control", "controlador", "controladores", "dualsense",
+    "dualshock", "auricular", "auriculares", "cascos", "volante", "volantes",
+    "funda", "fundas", "carcasa", "carcasas", "soporte", "soportes", "base",
+    "cargador", "cargadores", "cable", "cables", "adaptador", "grip", "grips",
+    "protector", "protectores", "bateria", "ventilador", "refrigerador",
+    "dock", "estacion", "kit", "steelbook", "poster", "posters", "pegatina",
+    "pegatinas", "camiseta", "taza", "llavero", "lampara", "mochila", "logo",
+    "nevera", "figura", "funko", "maqueta", "replica", "skin", "vinilo",
+    "juego", "juegos", "disco", "caja", "cristal", "tapa", "recambio",
+})
+
+# Words that only ever belong to a game or an accessory. Skipped when the title
+# leads with the console itself, because "Consola Xbox Series X + 2 Mandos y
+# Juegos" is a console being sold with its games.
+CONSOLE_NOT_A_CONSOLE_TOKENS = (
+    "juego", "juegos", "mando", "mandos", "dualsense", "dualshock",
+    "auriculares", "cascos", "volante", "steelbook", "funda", "carcasa",
+    "grips", "nevera", "funko",
+)
+
+# "para PS5" means the listing is *for* the console, not the console. A console
+# listing never says it.
+CONSOLE_FOR_RX = re.compile(
+    r"\bpara\s+(?:la\s+|el\s+|tu\s+)?"
+    r"(?:ps\s*[45]|play\s*station\s*[45]|playstation\s*[45]|xbox|consola)\b"
+)
+
+# One listing, two platform generations, means a game — a console is exactly
+# one platform. This is the single most reliable rule here, and it survives
+# normalise() flattening the slash.
+PLATFORM_RXS = {
+    "ps5":       re.compile(r"\bps\s*5\b|\bplay\s*(?:station\s*)?5\b"),
+    "ps4":       re.compile(r"\bps\s*4\b|\bplay\s*(?:station\s*)?4\b"),
+    "ps3":       re.compile(r"\bps\s*3\b|\bplay\s*(?:station\s*)?3\b"),
+    "ps2":       re.compile(r"\bps\s*2\b|\bplay\s*(?:station\s*)?2\b"),
+    "psp":       re.compile(r"\bpsp\b|\bps\s*vita\b"),
+    "xbox_sx":   re.compile(r"\bseri[ea]s?\s+x\b"),
+    "xbox_ss":   re.compile(r"\bseri[ea]s?\s+s\b|\bseri[ea]s?\s+x\s+s\b"),
+    "xbox_one":  re.compile(r"\bxbox\s+one\b"),
+    "xbox_360":  re.compile(r"\bxbox\s+360\b"),
+    "nintendo":  re.compile(r"\bnintendo\b|\bswitch\b|\bwii\b"),
+    "pc":        re.compile(r"\bsteam\s+deck\b"),
+}
+
+
 # Phrases that mean "not a sellable handset" wherever they appear. Multi-word,
 # so each carries its own context and cannot straddle an innocent sentence.
 PHONE_NOT_A_PHONE = (
@@ -298,6 +367,12 @@ _PHONE_NOT_A_PHONE_RX = _compile(PHONE_NOT_A_PHONE)
 _LAPTOP_PHRASES_RX = _compile(LAPTOP_PHRASES)
 _COMPONENT_PHRASES_RX = _compile(COMPONENT_PHRASES)
 
+# Any mention of a tracked console, used only to route into the console branch.
+_CONSOLE_TOKEN_RX = re.compile(
+    r"\bps\s*5\b|\bplay\s*(?:station\s*)?5\b"
+    r"|\bxbox\b(?=.*\bseri[ea]s?\s+[xs]\b)|\bseri[ea]s?\s+x\b(?=.*\bxbox\b)"
+)
+
 
 def _first_hit(
     haystack: str, compiled: tuple[tuple[str, re.Pattern[str]], ...]
@@ -335,6 +410,35 @@ def _leads_with_card_noun(norm_title: str) -> bool:
     return any(head.startswith(noun) for noun in CARD_NOUNS)
 
 
+def _is_console_title(norm_title: str) -> bool:
+    """Does this title name a PS5 or an Xbox Series console?
+
+    Like _is_phone_title, a false positive is cheap: every console rule that
+    follows is an accessory, game or cross-platform pattern, and a graphics card
+    whose title says "ps5" is not a graphics card either.
+    """
+    return _CONSOLE_TOKEN_RX.search(norm_title) is not None
+
+
+def _leads_with_console_noun(norm_title: str) -> bool:
+    """True when the title opens by naming the console itself.
+
+    This is the single most useful signal on a console search, and it comes
+    straight from how the two kinds of listing are actually written. A console
+    leads with what it is — "Consola PS5 con mando", "Xbox Series X 1TB SSD con
+    2 mandos", "Ps5 pro 2tb blanca sin caja". A game leads with the game —
+    "Elden Ring PS5", "Hogwarts Legacy Xbox Series X" — and mentions the
+    platform afterwards, because that is the word buyers search for.
+    """
+    head = " ".join(norm_title.split()[:3])
+    return any(head.startswith(noun) for noun in CONSOLE_LEAD_NOUNS)
+
+
+def _platforms_named(norm_title: str) -> int:
+    """How many distinct platform generations this title names."""
+    return sum(1 for rx in PLATFORM_RXS.values() if rx.search(norm_title))
+
+
 def check(title: str | None, description: str | None = None) -> JunkVerdict:
     """Return why a listing should be dropped, or CLEAN."""
     norm_title = normalise(title)
@@ -351,6 +455,34 @@ def check(title: str | None, description: str | None = None) -> JunkVerdict:
         hit = _first_hit(norm_title, _PHONE_NOT_A_PHONE_RX)
         if hit:
             return JunkVerdict(True, hit, "NOT_A_PHONE")
+        return _shared_rules(norm_title, haystack)
+
+    # Console rules, and only for titles naming a tracked console. Same shape as
+    # the phone branch: these listings have nothing to do with the bundle,
+    # laptop and CPU rules below, and those rules have nothing to say about
+    # them.
+    if _is_console_title(norm_title):
+        words = norm_title.split()
+        if words and words[0] in CONSOLE_ACCESSORY_PREFIXES:
+            return JunkVerdict(True, words[0], "NOT_A_CONSOLE")
+
+        # Two platforms named at once is a game, whatever else the title says —
+        # this one is not skipped for console-led titles, because "Xbox Series
+        # X/S" leads with the console and is still a game.
+        if _platforms_named(norm_title) > 1:
+            return JunkVerdict(True, "multi-platform", "NOT_A_CONSOLE")
+
+        if CONSOLE_FOR_RX.search(norm_title):
+            return JunkVerdict(True, "para", "NOT_A_CONSOLE")
+
+        # The remaining words are only decisive when the title does not lead
+        # with the console: a console legitimately ships "con 2 mandos y juegos".
+        if not _leads_with_console_noun(norm_title):
+            tokens = set(words)
+            for token in CONSOLE_NOT_A_CONSOLE_TOKENS:
+                if token in tokens:
+                    return JunkVerdict(True, token, "NOT_A_CONSOLE")
+
         return _shared_rules(norm_title, haystack)
 
     # Form-factor checks run on the title only and are skipped when the title

@@ -127,6 +127,23 @@ COMPS_MODELS = [
 # Keywords are the bare model names. models.classify requires the literal word
 # "iphone" before the number (see _iph), so "15 pro" alone can never match a
 # quantity or a size elsewhere in a title.
+# --------------------------------------------------------------- consoles
+# PS5 and Xbox Series X, tracked for COMPS ONLY on the same terms as the
+# phones: no alert searches here and there never should be, and
+# alert_loop.ALERTING_FAMILIES enforces that independently of this list.
+#
+# Expect these searches to be noisy in a way no other search here is. Roughly
+# four in five results are a game or an accessory carrying the console's name,
+# so junk.py's console branch and models.classify's "leads with the console"
+# rule do most of the work; what reaches a comps pool is a small fraction of
+# what comes back. That is the intended behaviour, not a fault.
+CONSOLE_COMPS = [
+    ("ps5_pro", "ps5 pro"),
+    ("ps5_digital", "ps5 digital"),
+    ("ps5", "ps5"),
+    ("xbox_series_x", "xbox series x"),
+]
+
 PHONE_COMPS = [
     ("iphone_15", "iphone 15"),
     ("iphone_15_plus", "iphone 15 plus"),
@@ -156,6 +173,16 @@ PHONE_COMPS = [
 # The measured medians put the 17 Pro above the 17 Pro Max, which is an artefact
 # of thin sampling (n=15 against n=77) rather than the market; the seeds below
 # restore the ordering the hardware actually has.
+# Opening guesses only, and deliberately conservative — every one of these is
+# is_seed until real reserved/sold comps replace it, and a seed that is too high
+# makes ordinary listings look like bargains. Spanish second-hand, Aug 2026.
+CONSOLE_SEED_PRICES = {
+    "ps5_pro": 600,       # launched 799 in Nov 2024
+    "ps5": 360,           # disc edition, incl. Slim
+    "ps5_digital": 300,
+    "xbox_series_x": 320,
+}
+
 PHONE_SEED_PRICES = {
     "iphone_15": 415,
     "iphone_15_plus": 430,
@@ -250,6 +277,7 @@ MIN_SEARCH_PRICE = config.MIN_SANE_PRICE
 
 
 SEED_PRICES.update(PHONE_SEED_PRICES)
+SEED_PRICES.update(CONSOLE_SEED_PRICES)
 
 
 def build_search_rows() -> list[dict]:
@@ -308,15 +336,15 @@ def build_search_rows() -> list[dict]:
             }
         )
 
-    for model_key, keywords in PHONE_COMPS:
+    for model_key, keywords in CONSOLE_COMPS + PHONE_COMPS:
         rows.append(
             {
                 "label": f"Comps {keywords.upper()}",
                 "role": "comps",
                 "keywords": keywords,
                 "model_key": model_key,
-                # No category: CATEGORY_GPU is meaningless for a handset, and
-                # the API ignores category_ids anyway (see config).
+                # No category: CATEGORY_GPU is meaningless for a handset or a
+                # console, and the API ignores category_ids anyway (see config).
                 "category_ids": None,
                 "max_price": None,
                 "min_price": MIN_SEARCH_PRICE,
