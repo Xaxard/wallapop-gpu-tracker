@@ -381,6 +381,85 @@ export async function getModelObservations(
   return data as ObservationRow[];
 }
 
+// ---------------------------------------------------------------------- sales
+
+export interface SaleRow extends ListingRow {
+  /** Non-null by construction — the query requires it. */
+  sold_price: number;
+  closed_at: string;
+  /** How long the listing was actually on sale, in days.
+   *
+   *  Measured from `posted_at` — the seller's own listing date — falling back to
+   *  `first_seen` when it is absent (present on ~95% of sold rows). The fallback
+   *  matters: `first_seen` is when the *tracker* noticed, which for anything
+   *  listed before the bot existed is far later than when it went on sale, and
+   *  would understate the time to sell. */
+  days_to_sale: number | null;
+}
+
+export interface SalesResult {
+  sales: SaleRow[];
+  /** Listings that closed without ever being seen reserved, so no price could
+   *  be attributed. Reported rather than hidden: it is far and away the larger
+   *  number, and it is the reason comps accumulate slowly. */
+  unpricedClosures: number;
+  truncated: boolean;
+}
+
+/**
+ * Every sale the tracker has actually confirmed a price for, newest first.
+ *
+ * "Sold" is an inference, not a fact Wallapop publishes, and the schema
+ * distinguishes two very different outcomes that both set `closed_at`:
+ *
+ *   - the listing was seen **reserved** and then disappeared. `sold_price` is
+ *     the price it carried while reserved — someone committed to that number.
+ *     These are the rows below, and they are the only thing the reference
+ *     prices are ever built from.
+ *   - the listing simply vanished. Might have sold, might have been deleted in
+ *     frustration. `comps_loop` writes `sold_price = null` deliberately rather
+ *     than guessing, and `collect_comps` never sees it.
+ *
+ * Filtering on `sold_price` rather than on `closed_at` is therefore the whole
+ * point of this page: it is the difference between "what did things sell for"
+ * and "what stopped being listed".
+ */
+export async function getSales(): Promise<SalesResult> {
+  const db = supabaseAdmin();
+
+  const [{ rows, truncated }, unpriced] = await Promise.all([
+    fetchAllPaged<ListingRow>((from, to, withCount) =>
+      db
+        .from("listings")
+        .select("*", withCount ? { count: "exact" } : undefined)
+        .not("closed_at", "is", null)
+        .not("sold_price", "is", null)
+        .order("closed_at", { ascending: false })
+        .range(from, to),
+    ),
+    db
+      .from("listings")
+      .select("*", { count: "exact", head: true })
+      .not("closed_at", "is", null)
+      .is("sold_price", null),
+  ]);
+  if (unpriced.error) throw unpriced.error;
+
+  const sales = rows.map((r) => {
+    const closed = r.closed_at as string;
+    const listed = r.posted_at ?? r.first_seen;
+    const first = listed ? Date.parse(listed) : NaN;
+    const end = Date.parse(closed);
+    const days =
+      Number.isFinite(first) && Number.isFinite(end)
+        ? Math.max(0, Math.round((end - first) / 86_400_000))
+        : null;
+    return { ...r, sold_price: r.sold_price as number, closed_at: closed, days_to_sale: days };
+  });
+
+  return { sales, unpricedClosures: unpriced.count ?? 0, truncated };
+}
+
 // ------------------------------------------------------------------- listings
 
 export async function getListings(): Promise<ListingRow[]> {

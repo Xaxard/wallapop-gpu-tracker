@@ -3,7 +3,7 @@
 import { useState } from "react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { Menu, LayoutDashboard, Receipt, Cpu, ListChecks, SlidersHorizontal } from "lucide-react";
+import { Menu, LayoutDashboard, Receipt, BadgeEuro, Cpu, ListChecks, SlidersHorizontal } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Sheet, SheetContent, SheetTitle, SheetTrigger } from "@/components/ui/sheet";
 import { ThemeToggle } from "@/components/theme-toggle";
@@ -13,6 +13,7 @@ import { cn } from "@/lib/utils";
 const NAV = [
   { href: "/", label: "Overview", icon: LayoutDashboard },
   { href: "/deals", label: "Deals & Alerts", icon: Receipt },
+  { href: "/sales", label: "Sales", icon: BadgeEuro },
   { href: "/models", label: "Models", icon: Cpu },
   { href: "/listings", label: "Listings", icon: ListChecks },
   { href: "/searches", label: "Searches & Junk", icon: SlidersHorizontal },

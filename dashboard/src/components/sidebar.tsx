@@ -5,11 +5,12 @@ import { usePathname } from "next/navigation";
 import { cn } from "@/lib/utils";
 import { ThemeToggle } from "@/components/theme-toggle";
 import { LogoutButton } from "@/components/logout-button";
-import { LayoutDashboard, Receipt, Cpu, ListChecks, SlidersHorizontal } from "lucide-react";
+import { LayoutDashboard, Receipt, BadgeEuro, Cpu, ListChecks, SlidersHorizontal } from "lucide-react";
 
 const NAV = [
   { href: "/", label: "Overview", icon: LayoutDashboard },
   { href: "/deals", label: "Deals & Alerts", icon: Receipt },
+  { href: "/sales", label: "Sales", icon: BadgeEuro },
   { href: "/models", label: "Models", icon: Cpu },
   { href: "/listings", label: "Listings", icon: ListChecks },
   { href: "/searches", label: "Searches & Junk", icon: SlidersHorizontal },
